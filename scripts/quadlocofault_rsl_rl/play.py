@@ -66,7 +66,8 @@ import time
 
 import gymnasium as gym
 import torch
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+from rsl_rl.runners import DistillationRunner
+from runners import CustomOnPolicyRunner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -80,20 +81,22 @@ from isaaclab.utils.dict import print_dict
 
 from isaaclab_rl.rsl_rl import (
     RslRlBaseRunnerCfg,
-    RslRlVecEnvWrapper,
     export_policy_as_jit,
     export_policy_as_onnx,
     handle_deprecated_rsl_rl_cfg,
 )
+from isaaclab_quadlocofault_rl.rsl_rl import CustomRslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-import quadlocofault.tasks  # noqa: F401
-
-
+import isaaclab_quadlocofault_tasks  # noqa: F401
+import isaacsim.core.utils.stage as stage_utils
+from pxr import UsdPhysics, UsdGeom, Gf, Sdf
+if not args_cli.headless:
+    import omni.ui as ui 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -152,12 +155,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    env = CustomRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        runner = CustomOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
@@ -172,8 +175,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     if version.parse(installed_version) >= version.parse("4.0.0"):
         # use the new export functions for rsl-rl >= 4.0.0
-        runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
-        runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
+        # runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
+        # runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
+        pass
     else:
         # extract the neural network for rsl-rl < 4.0.0
         if version.parse(installed_version) >= version.parse("2.3.0"):
@@ -190,8 +194,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             normalizer = None
 
         # export to JIT and ONNX
-        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+        # export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        # export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
 
@@ -202,9 +206,47 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     while simulation_app.is_running():
         start_time = time.time()
         # run everything in inference mode
+        asset = env.unwrapped.scene["robot"]
+        # breakpoint()
+        # Vis debug joint fault
+        if (asset.faulty_joint_idx > 0).sum() > 0:
+            
+            stage = stage_utils.get_current_stage()
+            dof_paths = asset.root_physx_view.dof_paths[0]  # joint prim paths
+            body_name_to_id = {n: i for i, n in enumerate(asset.body_names)}
+
+            env_idx = asset.faulty_joint_idx.nonzero()[:,0]
+            fault_idx = asset.faulty_joint_idx.nonzero()[:,1]
+            parent_ids = []
+            child_ids = []
+            for j in fault_idx:
+                joint_prim = UsdPhysics.Joint.Get(stage, dof_paths[j])
+                body0 = joint_prim.GetBody0Rel().GetTargets()[0]  # parent
+                body1 = joint_prim.GetBody1Rel().GetTargets()[0]  # child
+                parent_name = body0.pathString.split("/")[-1]
+                child_name = body1.pathString.split("/")[-1]
+                parent_ids.append(body_name_to_id[parent_name])
+                child_ids.append(body_name_to_id[child_name])
+            parent_ids = torch.tensor(parent_ids, device=asset.device)
+            child_ids = torch.tensor(child_ids, device=asset.device)
+            _link_idx = child_ids
+            # breakpoint()
+            # try:
+            pos = asset.data.body_pos_w[env_idx, _link_idx, :]
+            # except:
+            #     breakpoint()
+            env.unwrapped._fault_marker.visualize(translations=pos)
+            # breakpoint()
+            # if timestep % 15 == 0:
+            #     print(np.array(asset.joint_names)[(asset.faulty_joint_idx[asset.faulty_joint_idx >= 0]).tolist()])
+            #     print(asset.motors_strength[_env_idx])        
+        
         with torch.inference_mode():
             # agent stepping
-            actions = policy(obs)
+            # breakpoint()
+            # obs_policy, obs_hist = obs['policy'], obs['history']
+            # actions, _ = policy(obs_policy, obs_hist)
+            actions, _ = policy(obs)
             # env stepping
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated

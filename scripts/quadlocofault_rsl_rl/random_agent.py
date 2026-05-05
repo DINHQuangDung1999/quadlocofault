@@ -35,7 +35,8 @@ import torch
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
-import quadlocofault_tasks  # noqa: F401
+import isaaclab_quadlocofault_tasks  # noqa: F401
+from isaaclab_quadlocofault_rl.rsl_rl.vecenv_wrapper import CustomRslRlVecEnvWrapper
 
 def main():
     """Random actions agent with Isaac Lab environment."""
@@ -50,6 +51,7 @@ def main():
     print(f"[INFO]: Gym observation space: {env.observation_space}")
     print(f"[INFO]: Gym action space: {env.action_space}")
     
+    env = CustomRslRlVecEnvWrapper(env)
     # reset environment
     env.reset()
     # simulate environment
