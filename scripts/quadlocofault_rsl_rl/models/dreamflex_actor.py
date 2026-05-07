@@ -59,9 +59,11 @@ class DreamFLEXActor(nn.Module):
         self.obs_normalization = obs_normalization
         if obs_normalization:
             self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
-            self.obs_hist_normalizer = EmpiricalNormalization(self.obs_dim)
+            self.critic_obs_normalizer = EmpiricalNormalization(self.priv_obs_dim)
+            self.obs_hist_normalizer = EmpiricalNormalization([self.obs_hist_length, self.obs_dim])
         else:
             self.obs_normalizer = torch.nn.Identity()
+            self.critic_obs_normalizer = torch.nn.Identity()
             self.obs_hist_normalizer = torch.nn.Identity()
 
         # Distribution
@@ -105,8 +107,7 @@ class DreamFLEXActor(nn.Module):
         obs: TensorDict,
         masks: torch.Tensor | None = None,
         hidden_state: HiddenState = None,
-        stochastic_output: bool = False,
-        return_latent: bool = False
+        stochastic_output: bool = False
     ) -> torch.Tensor:
         """Forward pass of the MLP model.
 
@@ -140,7 +141,7 @@ class DreamFLEXActor(nn.Module):
         """Build the model latent by concatenating and normalizing selected observation groups."""
         # Select and concatenate observations
         # Normalize observations
-        obs_hist = self.obs_hist_normalizer(obs['history'].flatten(1,2))
+        obs_hist = self.obs_hist_normalizer(obs['history']).flatten(1,2)
         distribution = self.hist_encoder_mlp(obs_hist)
 
         mean_latent = self.mean_latent_encoder_mlp(distribution)
@@ -228,6 +229,7 @@ class DreamFLEXActor(nn.Module):
         if self.obs_normalization:
             # Update the normalizer parameters
             self.obs_normalizer.update(obs['policy'])  # type: ignore
+            self.critic_obs_normalizer.update(obs['critic'])
             self.obs_hist_normalizer.update(obs['history'])
 
 

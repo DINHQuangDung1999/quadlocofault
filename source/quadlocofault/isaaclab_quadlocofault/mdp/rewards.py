@@ -201,4 +201,71 @@ def VHIP_style_reward(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg
     # breakpoint()
     return 0.015*theta + 0.01*theta_ddot + 0.01*d_max
 
-    
+def raibert_foot_placement_reward(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    stance_time: float,
+    nominal_foot_positions_xy: list[list[float]],
+    vel_gain: float = 0.0,
+) -> torch.Tensor:
+    """Penalize foot xy placement error against a Raibert-style desired foothold.
+
+    The desired foothold is defined in the yaw-aligned body frame as:
+
+        p_des_xy = p_nom_xy + 0.5 * stance_time * v_cmd_xy
+                   + vel_gain * (v_body_xy - v_cmd_xy)
+
+    Args:
+        command_name: Usually "base_velocity".
+        asset_cfg: Robot asset with foot body_ids resolved in the desired foot order.
+        stance_time: Approximate stance duration used by the Raibert heuristic.
+        nominal_foot_positions_xy: Per-foot nominal xy positions in the yaw/body frame.
+            Example for Go2:
+                [[ 0.20,  0.13],
+                 [ 0.20, -0.13],
+                 [-0.20,  0.13],
+                 [-0.20, -0.13]]
+        vel_gain: Optional feedback term on body velocity tracking error.
+
+    Returns:
+        Sum of squared xy placement error for all selected feet.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    # commanded and measured planar base velocity in body frame
+    cmd = env.command_manager.get_command(command_name)
+    v_cmd_xy = cmd[:, :2]                          # (N, 2)
+    v_body_xy = asset.data.root_lin_vel_b[:, :2]  # (N, 2)
+
+    # current foot positions in the yaw-aligned body frame
+    foot_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]               # (N, F, 3)
+    root_pos_w = asset.data.root_pos_w.unsqueeze(1)                            # (N, 1, 3)
+    foot_pos_rel_w = foot_pos_w - root_pos_w                                   # (N, F, 3)
+
+    num_envs = foot_pos_w.shape[0]
+    num_feet = foot_pos_w.shape[1]
+
+    yaw_quat_w = yaw_quat(asset.data.root_quat_w)                              # (N, 4)
+    yaw_quat_feet = yaw_quat_w.unsqueeze(1).expand(-1, num_feet, -1)           # (N, F, 4)
+
+    foot_pos_b = quat_rotate_inverse(
+        yaw_quat_feet.reshape(-1, 4),
+        foot_pos_rel_w.reshape(-1, 3),
+    ).view(num_envs, num_feet, 3)
+
+    foot_xy = foot_pos_b[:, :, :2]                                             # (N, F, 2)
+
+    # nominal per-foot stance template in yaw/body frame
+    p_nom_xy = torch.tensor(
+        nominal_foot_positions_xy, dtype=foot_xy.dtype, device=foot_xy.device
+    ).unsqueeze(0).expand(num_envs, -1, -1)                                    # (N, F, 2)
+
+    # Raibert-style desired foothold
+    p_des_xy = (
+        p_nom_xy
+        + 0.5 * stance_time * v_cmd_xy.unsqueeze(1)
+        + vel_gain * (v_body_xy - v_cmd_xy).unsqueeze(1)
+    )
+
+    return torch.sum(torch.square(foot_xy - p_des_xy), dim=(1, 2))

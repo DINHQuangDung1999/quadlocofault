@@ -75,6 +75,7 @@ tests/
 **/gelsight_r15_data/*
 
 # misc
-/*.sh
+/train_mini_headless.sh
+/train_mini.sh
 /data
 /*.ipynb

@@ -15,10 +15,13 @@ from rsl_rl.models.mlp_model import MLPModel
 from modules import CNN1D
 from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
 from rsl_rl.modules.distribution import Distribution
-from rsl_rl.utils import resolve_callable, unpad_trajectories
+from rsl_rl.utils import resolve_callable, unpad_trajectories, resolve_nn_activation
 
+from torchdiffeq import odeint_adjoint
+from torchdiffeq import odeint
+import numpy as np 
 
-class DreamFLEXActor(nn.Module):
+class PINNActor(nn.Module):
 
     is_recurrent: bool = False
     """Whether the model contains a recurrent module."""
@@ -32,8 +35,8 @@ class DreamFLEXActor(nn.Module):
         distribution_cfg: dict | None = None,
         actor_hidden_dims: tuple[int, ...] | list[int] = (512, 256, 128),
         hist_encoder_hidden_dims: tuple[int, ...] | list[int] = (512, 256, 128),
-        latent_decoder_hidden_dims: tuple[int, ...] | list[int] = (64, 128),
-        fault_decoder_hidden_dims: tuple[int, ...] | list[int] = (64, 64),
+        # latent_decoder_hidden_dims: tuple[int, ...] | list[int] = (64, 128),
+        # fault_decoder_hidden_dims: tuple[int, ...] | list[int] = (64, 64),
         latent_dim: int = 16,
     ) -> None:
         """Initialize the MLP-based model.
@@ -53,16 +56,17 @@ class DreamFLEXActor(nn.Module):
         self.obs_hist_length, self.obs_dim = obs['history'].shape[1:]
         self.latent_dim = latent_dim
         self.action_dim = output_dim
-        self.encoder_out_dim = 3 + self.action_dim + self.latent_dim # 3 + 12 + 16,
 
         # Observation normalization
         self.obs_normalization = obs_normalization
         if obs_normalization:
             self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
             self.obs_hist_normalizer = EmpiricalNormalization(self.obs_dim)
+            self.obs_critic_normalizer = EmpiricalNormalization(self.obs_dim)
         else:
             self.obs_normalizer = torch.nn.Identity()
             self.obs_hist_normalizer = torch.nn.Identity()
+            self.obs_critic_normalizer = torch.nn.Identity()
 
         # Distribution
         if distribution_cfg is not None:
@@ -74,21 +78,44 @@ class DreamFLEXActor(nn.Module):
             mlp_output_dim = output_dim
 
         # MLP
-        self.actor_mlp = MLP(self.obs_dim + self.encoder_out_dim, mlp_output_dim, actor_hidden_dims, activation)
+        # self.actor_mlp = MLP(self.obs_dim * 2 + 12, mlp_output_dim, actor_hidden_dims, activation)
+        # self.actor_mlp = MLP(self.obs_dim + 24 + 12, mlp_output_dim, actor_hidden_dims, activation)
+        self.actor_mlp = MLP(self.obs_dim, mlp_output_dim, actor_hidden_dims, activation)
         # Encoders
         self.hist_encoder_mlp = MLP(self.obs_dim * self.obs_hist_length, 
-                                    hist_encoder_hidden_dims[-1], 
-                                    hist_encoder_hidden_dims[:-1], 
+                                    latent_dim, 
+                                    hist_encoder_hidden_dims, 
                                     activation)
-        code_dim = hist_encoder_hidden_dims[-1]
-        self.mean_vel_encoder_mlp = nn.Linear(code_dim, 3)
-        self.logvar_vel_encoder_mlp = nn.Linear(code_dim, 3)
-        self.mean_latent_encoder_mlp = nn.Linear(code_dim, self.latent_dim)
-        self.logvar_latent_encoder_mlp = nn.Linear(code_dim, self.latent_dim)
-        self.fault_logit_encoder_mlp = nn.Linear(code_dim, self.action_dim)
+        self.priv_encoder_mlp = MLP(obs['critic'].shape[1], 
+                                    latent_dim, 
+                                    hist_encoder_hidden_dims, 
+                                    activation)
+        # self.hist_encoder_mlp = nn.Sequential(
+        #               nn.Linear(self.obs_dim, latent_dim),
+        #               resolve_nn_activation(activation),
+        #               nn.GRU(latent_dim, latent_dim, num_layers=1, batch_first=True),
+        # )
+
+        # self.func = LatentODEfunc(latent_dim, 20)
+        # self.rec = RecognitionRNN(latent_dim, self.obs_dim, latent_dim, obs['history'].shape[0])
+        # self.dec = Decoder(latent_dim, self.obs_dim, 20)
+    
+        # self.mean_vel_encoder_mlp = nn.Linear(latent_dim, 3)
+        # self.logvar_vel_encoder_mlp = nn.Linear(latent_dim, 3)
+        self.motor_strengths_encoder_mlp = nn.Linear(latent_dim, self.action_dim) 
+        self.mean_latent_encoder_mlp = nn.Linear(latent_dim, latent_dim)
+        self.logvar_latent_encoder_mlp = nn.Linear(latent_dim, latent_dim)
+        self.phys_latent_encoder_mlp = nn.Linear(latent_dim, latent_dim)
+        # self.fault_logit_encoder_mlp = nn.Linear(latent_dim, self.action_dim)
         # Decoders
-        self.latent_decoder_mlp = MLP(self.latent_dim, self.obs_dim, latent_decoder_hidden_dims, activation)
-        self.fault_decoder_mlp = MLP(self.action_dim, self.latent_dim * 2, fault_decoder_hidden_dims, activation)
+        self.Minv_head = nn.Linear(latent_dim, self.action_dim*(self.action_dim + 1)//2)
+        self.fn_head = nn.Linear(latent_dim, self.action_dim)  
+        self.torque_head = nn.Linear(latent_dim + 2 * self.action_dim, self.action_dim) 
+        # self.partial_next_obs_head = MLP(latent_dim, 
+        #                             25, 
+        #                             [256, 128], 
+        #                             activation)
+        # self.fault_head = nn.Linear(latent_dim, self.action_dim)
         # Initialize distribution-specific MLP weights
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.actor_mlp)
@@ -105,7 +132,6 @@ class DreamFLEXActor(nn.Module):
         masks: torch.Tensor | None = None,
         hidden_state: HiddenState = None,
         stochastic_output: bool = False,
-        return_latent: bool = False
     ) -> torch.Tensor:
         """Forward pass of the MLP model.
 
@@ -114,23 +140,64 @@ class DreamFLEXActor(nn.Module):
             was provided) and defaults to ``False``, meaning that even stochastic models will return deterministic
             outputs by default.
         """
-        # breakpoint()
-        # Get MLP input latent
         obs_policy = self.obs_normalizer(obs['policy'])
-        latent_outputs = self.get_latent(obs)
-        hist_latent = latent_outputs[0]
-        actor_input = torch.cat([hist_latent, obs_policy], dim = -1)
 
+  
+        # Get MLP input latent
+        latent_outputs = self.get_latent(obs)
+        priv_latent, hist_latent, state_latent, _, _, phys_latent, pred_motors_strength = latent_outputs
+
+        # im_next_partial_obs = self.partial_next_obs_head(state_latent)
+        # im_next_action = im_next_partial_obs[:,:12]
+        # obs_ = torch.concat([obs_policy, torch.zeros((obs_policy.shape[0], self.latent_dim), device = obs.device)], dim = -1)
+        # im_action = self.actor_mlp(obs_)
+        relu = resolve_nn_activation("relu")
+        Lterms = self.Minv_head(phys_latent)
+        L = torch.zeros((Lterms.shape[0], self.action_dim, self.action_dim), device=obs.device)
+        idx = torch.tril_indices(self.action_dim, self.action_dim, offset=-1)
+        L[:, idx[0], idx[1]] = Lterms[:, self.action_dim:]
+        L += torch.diag_embed(nn.Sigmoid()(Lterms[:, :self.action_dim]))
+        # L += torch.diag_embed(relu(Lterms[:, :self.action_dim]) + 0.1)
+        Minv = L @ L.transpose(1,2)
+        # breakpoint()
+
+        # breakpoint()
+        # fn and delta q
+        fn = self.fn_head(phys_latent)
+        # tau = self.torque_head(torch.cat([phys_latent, pred_motors_strength, im_action], dim = -1))
+        obs_critic = self.obs_critic_normalizer(obs['critic'])
+        # breakpoint()
+        tau = obs_critic[:,-36:-24]
+        # integrate
+        # breakpoint()
+        dt = 0.005
+        q, qdot = obs['history'][:,-2,:self.action_dim], obs['history'][:,-2,self.action_dim:self.action_dim*2]
+        # breakpoint()
+        pred_qddot = Minv @ (tau + fn).unsqueeze(-1)
+        pred_qdot = qdot + pred_qddot.squeeze(-1) * dt 
+        pred_q    =  q + pred_qdot * dt
+
+        pred_state = torch.cat([pred_q, pred_qdot], dim = -1)
+        error = obs['policy'][:,:24] - pred_state
         # MLP forward pass
         # breakpoint()
-        mlp_output = self.actor_mlp(actor_input)
+        
         # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
+        # Action
+        obs_policy = self.obs_normalizer(obs['policy'])
+        actor_input = torch.cat([obs_policy, error, pred_motors_strength], dim = -1)
+
+        mlp_output = self.actor_mlp(actor_input)
         if self.distribution is not None:
-            if stochastic_output:
-                self.distribution.update(mlp_output)
-                return self.distribution.sample(), latent_outputs
-            return self.distribution.deterministic_output(mlp_output), latent_outputs
-        return mlp_output, latent_outputs
+            try:
+                if stochastic_output:
+                    self.distribution.update(mlp_output)
+                    action = self.distribution.sample()
+                else:
+                    action = self.distribution.deterministic_output(mlp_output)
+            except:
+                breakpoint()
+        return action, (latent_outputs, error, tau)
     
     def get_latent(
         self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
@@ -139,34 +206,41 @@ class DreamFLEXActor(nn.Module):
         # Select and concatenate observations
         # Normalize observations
         obs_hist = self.obs_hist_normalizer(obs['history'].flatten(1,2))
-        distribution = self.hist_encoder_mlp(obs_hist)
+        hist_latent = self.hist_encoder_mlp(obs_hist)
+        # obs_hist = self.obs_hist_normalizer(obs['history'])
+        # o_n, h_n = self.hist_encoder_mlp(obs_hist)
+        # hist_latent = o_n.mean(1)
+        priv_latent = self.get_priv_latent(obs)
 
-        mean_latent = self.mean_latent_encoder_mlp(distribution)
-        logvar_latent = self.logvar_latent_encoder_mlp(distribution)
+        mean_latent = self.mean_latent_encoder_mlp(hist_latent)
+        logvar_latent = self.logvar_latent_encoder_mlp(hist_latent)
+        state_latent = self.reparameterise(mean_latent,logvar_latent)
 
-        mean_vel = self.mean_vel_encoder_mlp(distribution)
-        logvar_vel = self.logvar_vel_encoder_mlp(distribution)
+        phys_latent = self.phys_latent_encoder_mlp(hist_latent)
 
-        code_latent = self.reparameterise(mean_latent,logvar_latent)
-        code_vel = self.reparameterise(mean_vel,logvar_vel)
-
-        
-        fault_logit = self.fault_logit_encoder_mlp(distribution)
+        motors_strength = self.motor_strengths_encoder_mlp(hist_latent)
+        motors_strength = 1 + nn.Tanh()(motors_strength)
+        # fault_logit = self.fault_logit_encoder_mlp(distribution)
         # fault_label = torch.max(fault_logit, dim = -1)[1]
         # fault_binarylabel = torch.zeros_like(fault_logit).to(fault_logit.device)
         # fault_binarylabel[torch.arange(fault_binarylabel.shape[0]), fault_label] = 1.
 
-        gamma = self.fault_decoder_mlp(fault_logit)
+        # gamma = self.fault_decoder_mlp(fault_logit)
 
-        decode = self.latent_decoder_mlp(code_latent)
+        # decode = self.latent_decoder_mlp(code_latent)
 
-        code_latent = gamma[:,:self.latent_dim] * code_latent + gamma[:,self.latent_dim:]
+        # code_latent = gamma[:,:self.latent_dim] * code_latent + gamma[:,self.latent_dim:]
 
-        code = torch.cat((code_vel, fault_logit, code_latent),dim=-1)
+        # code = torch.cat((code_vel, fault_logit, code_latent),dim=-1)
+        return priv_latent, hist_latent, state_latent, mean_latent, logvar_latent, phys_latent, motors_strength
 
-        return code, code_vel, decode, mean_vel, logvar_vel, mean_latent, logvar_latent, fault_logit
-
-
+    def get_priv_latent(
+        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
+    ) -> torch.Tensor:
+        obs_critic_hist = self.obs_critic_normalizer(obs['critic'])
+        priv_latent = self.priv_encoder_mlp(obs_critic_hist)
+        return priv_latent
+    
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         """Reset the internal state for recurrent models (no-op)."""
         pass
@@ -211,7 +285,7 @@ class DreamFLEXActor(nn.Module):
 
     def as_jit(self) -> nn.Module:
         """Return a version of the model compatible with Torch JIT export."""
-        return _TorchDreamFLEXActor(self)
+        return _TorchPINNActor(self)
 
     def as_onnx(self, verbose: bool) -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
@@ -226,10 +300,10 @@ class DreamFLEXActor(nn.Module):
 
 
 
-class _TorchDreamFLEXActor(nn.Module):
+class _TorchPINNActor(nn.Module):
     """Exportable CNN model for JIT."""
 
-    def __init__(self, model: DreamFLEXActor) -> None:
+    def __init__(self, model: PINNActor) -> None:
         """Create a TorchScript-friendly copy of a CNNModel."""
         super().__init__()
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
@@ -260,7 +334,7 @@ class _TorchDreamFLEXActor(nn.Module):
 class _OnnxMLPModel(nn.Module):
     """Exportable CNN model for ONNX."""
 
-    def __init__(self, model: DreamFLEXActor, verbose: bool) -> None:
+    def __init__(self, model: PINNActor, verbose: bool) -> None:
         """Create an ONNX-export wrapper around a CNNModel."""
         super().__init__()
         self.verbose = verbose
@@ -312,3 +386,73 @@ class _OnnxMLPModel(nn.Module):
         """Return ONNX output tensor names."""
         return ["actions"]
 
+
+
+class LatentODEfunc(nn.Module):
+
+    def __init__(self, latent_dim=4, nhidden=20):
+        super(LatentODEfunc, self).__init__()
+        self.elu = nn.ELU(inplace=True)
+        self.fc1 = nn.Linear(latent_dim, nhidden)
+        self.fc2 = nn.Linear(nhidden, nhidden)
+        self.fc3 = nn.Linear(nhidden, latent_dim)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+        out = self.fc1(x)
+        out = self.elu(out)
+        out = self.fc2(out)
+        out = self.elu(out)
+        out = self.fc3(out)
+        return out
+
+
+class RecognitionRNN(nn.Module):
+
+    def __init__(self, latent_dim=4, obs_dim=2, nhidden=25, nbatch=1):
+        super(RecognitionRNN, self).__init__()
+        self.nhidden = nhidden
+        self.nbatch = nbatch
+        self.i2h = nn.Linear(obs_dim + nhidden, nhidden)
+        self.h2o = nn.Linear(nhidden, latent_dim * 2)
+
+    def forward(self, x, h):
+        # breakpoint()
+        combined = torch.cat((x, h), dim=1)
+        h = torch.tanh(self.i2h(combined))
+        out = self.h2o(h)
+        return out, h
+
+    def initHidden(self, batch, hidden):
+        return torch.zeros(batch, hidden)
+
+
+class Decoder(nn.Module):
+
+    def __init__(self, latent_dim=4, obs_dim=2, nhidden=20):
+        super(Decoder, self).__init__()
+        self.relu = nn.ReLU(inplace=True)
+        self.fc1 = nn.Linear(latent_dim, nhidden)
+        self.fc2 = nn.Linear(nhidden, obs_dim)
+
+    def forward(self, z):
+        out = self.fc1(z)
+        out = self.relu(out)
+        out = self.fc2(out)
+        return out
+    
+
+def log_normal_pdf(x, mean, logvar):
+    const = torch.from_numpy(np.array([2. * np.pi])).float().to(x.device)
+    const = torch.log(const)
+    return -.5 * (const + logvar + (x - mean) ** 2. / torch.exp(logvar))
+
+def normal_kl(mu1, lv1, mu2, lv2):
+    v1 = torch.exp(lv1)
+    v2 = torch.exp(lv2)
+    lstd1 = lv1 / 2.
+    lstd2 = lv2 / 2.
+
+    kl = lstd2 - lstd1 + ((v1 + (mu1 - mu2) ** 2.) / (2. * v2)) - .5
+    return kl

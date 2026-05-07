@@ -15,7 +15,6 @@ class UnitreeGo2PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 2000
     save_interval = 100
     experiment_name = "unitree_go2_base"
-    empirical_normalization = False
 
     algorithm = RslRlPpoAlgorithmCfg(
         class_name="PPO",
@@ -38,14 +37,14 @@ class UnitreeGo2RoughPPORunnerCfg(UnitreeGo2PPORunnerCfg):
     actor = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",
-        obs_normalization=False,
+        obs_normalization=True,
         distribution_cfg = RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0,
                                                                     std_type="log")
     )
     critic = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",
-        obs_normalization=False,
+        obs_normalization=True,
         distribution_cfg = None
     )
     def __post_init__(self):
@@ -58,7 +57,7 @@ class UnitreeGo2RoughPPOFTNetRunnerCfg(UnitreeGo2PPORunnerCfg):
     actor = RslRlFTNetActorCfg(
         actor_hidden_dims=[512, 256, 128],
         activation="elu",
-        obs_normalization=False,
+        obs_normalization=True,
         distribution_cfg = RslRlFTNetActorCfg.GaussianDistributionCfg(init_std=1.0,std_type="log"),
         priv_encoder_hidden_dims =[256, 128],
         hist_encoder_output_channels = [32,32,32], 
@@ -76,7 +75,7 @@ class UnitreeGo2RoughPPOFTNetRunnerCfg(UnitreeGo2PPORunnerCfg):
     critic = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",
-        obs_normalization=False,
+        obs_normalization=True,
         distribution_cfg = None
     )
     def __post_init__(self):
@@ -89,7 +88,7 @@ class UnitreeGo2RoughPPOFLEXRunnerCfg(UnitreeGo2PPORunnerCfg):
     actor = RslRlDreamFLEXActorCfg(
         actor_hidden_dims=[512, 256, 128],
         activation="elu",
-        obs_normalization=False,
+        obs_normalization=True,
         distribution_cfg = RslRlDreamFLEXActorCfg.GaussianDistributionCfg(init_std=1.0,
                                                                     std_type="log"),
         hist_encoder_hidden_dims=[512, 256, 128],
@@ -100,7 +99,7 @@ class UnitreeGo2RoughPPOFLEXRunnerCfg(UnitreeGo2PPORunnerCfg):
     critic = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",
-        obs_normalization=False,
+        obs_normalization=True,
         distribution_cfg = None
     )
     def __post_init__(self):
@@ -113,7 +112,7 @@ class UnitreeGo2RoughPPOPINNRunnerCfg(UnitreeGo2PPORunnerCfg):
     actor = RslRlPINNActorCfg(
         actor_hidden_dims=[512, 256, 128],
         activation="elu",
-        obs_normalization=False,
+        obs_normalization=True,
         distribution_cfg = RslRlPINNActorCfg.GaussianDistributionCfg(init_std=1.0,
                                                                     std_type="log"),
         hist_encoder_hidden_dims=[512, 256, 128],
@@ -124,7 +123,7 @@ class UnitreeGo2RoughPPOPINNRunnerCfg(UnitreeGo2PPORunnerCfg):
     critic = RslRlMLPModelCfg(
         hidden_dims=[512, 256, 128],
         activation="elu",
-        obs_normalization=False,
+        obs_normalization=True,
         distribution_cfg = None
     )
     def __post_init__(self):
@@ -138,7 +137,6 @@ class UnitreeGo2FlatPPORunnerCfg(UnitreeGo2RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.max_iterations = 2000
         self.experiment_name = "unitree_go2_flat_base"
 
 @configclass
@@ -146,7 +144,6 @@ class UnitreeGo2FlatPPOFTNetRunnerCfg(UnitreeGo2RoughPPOFTNetRunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.max_iterations = 2000
         self.experiment_name = "unitree_go2_flat_ftnet"
 
 @configclass
@@ -154,7 +151,6 @@ class UnitreeGo2FlatPPOFLEXRunnerCfg(UnitreeGo2RoughPPOFLEXRunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.max_iterations = 2000
         self.experiment_name = "unitree_go2_flat_flex"
 
 
@@ -163,6 +159,5 @@ class UnitreeGo2FlatPPOPINNRunnerCfg(UnitreeGo2RoughPPOPINNRunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.max_iterations = 2000
         self.experiment_name = "unitree_go2_flat_pinn"
 

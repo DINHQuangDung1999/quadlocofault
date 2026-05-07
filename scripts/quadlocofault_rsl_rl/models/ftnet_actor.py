@@ -72,8 +72,8 @@ class FTNetActor(nn.Module):
         self.obs_normalization = obs_normalization
         if obs_normalization:
             self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
-            self.critic_obs_normalizer = EmpiricalNormalization(self.obs_dim)
-            self.obs_hist_normalizer = EmpiricalNormalization(self.obs_dim)
+            self.critic_obs_normalizer = EmpiricalNormalization(self.priv_obs_dim)
+            self.obs_hist_normalizer = EmpiricalNormalization([self.obs_hist_length, self.obs_dim])
         else:
             self.obs_normalizer = torch.nn.Identity()
             self.critic_obs_normalizer = torch.nn.Identity()

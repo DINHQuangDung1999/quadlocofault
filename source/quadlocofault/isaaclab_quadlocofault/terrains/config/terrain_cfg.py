@@ -6,7 +6,7 @@
 """Configuration for custom terrains."""
 
 import isaaclab.terrains as terrain_gen
-
+from isaaclab_quadlocofault.terrains import CustomHfRandomUniformTerrainCfg
 from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 
 ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
@@ -38,8 +38,8 @@ ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
         # "boxes": terrain_gen.MeshRandomGridTerrainCfg(
         #     proportion=0.2, grid_width=0.45, grid_height_range=(0.05, 0.2), platform_width=2.0
         # ),
-        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-            proportion=0.5, noise_range=(0.01, 0.10), noise_step=0.01, border_width=0.25
+        "random_rough": CustomHfRandomUniformTerrainCfg(
+            proportion=1.0, noise_range=(0.01, 0.10), noise_step=0.01, border_width=0.25
         ),
         # "hf_pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
         #     proportion=0.25, slope_range=(0.0, 1.0), platform_width=2.0, border_width=0.25

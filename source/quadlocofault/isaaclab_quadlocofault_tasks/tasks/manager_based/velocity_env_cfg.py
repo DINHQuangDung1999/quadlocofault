@@ -29,7 +29,7 @@ from isaaclab_quadlocofault.actuators import CustomDCMotorCfg
 ##
 # Pre-defined configs
 ##
-from .terrain_cfg import ROUGH_TERRAINS_CFG  # isort: skip
+from isaaclab_quadlocofault.terrains import ROUGH_TERRAINS_CFG  # isort: skip
 
 
 ##
@@ -244,17 +244,17 @@ class EventCfg:
             },
         mode="reset",
     )
-    # randomize_actuator_faults = EventTerm(
-    #     func= mdp.randomize_actuator_faults,
-    #     params={
-    #         "asset_cfg" :SceneEntityCfg("robot", joint_names=".*"),
-    #         "ratio": 0.5,
-    #         "failure_range": (0.3, 0.8),
-    #         "num_faults": 1,
-    #         },
-    #     mode="interval",
-    #     interval_range_s=(5.0, 8.0),
-    # )
+    randomize_actuator_faults = EventTerm(
+        func= mdp.randomize_actuator_faults,
+        params={
+            "asset_cfg" :SceneEntityCfg("robot", joint_names=".*"),
+            "ratio": 0.5,
+            "failure_range": (0.3, 0.8),
+            "num_faults": 1,
+            },
+        mode="interval",
+        interval_range_s=(5.0, 8.0),
+    )
     # set_actuator_faults = EventTerm(
     #     func = mdp.set_actuator_faults,
     #     params = {
@@ -311,7 +311,7 @@ class RewardsCfg:
     )
     foot_clearance = RewTerm(
         func=mdp.foot_clearance_reward,
-        weight=0.5,
+        weight=-0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
             "target_height": 0.15,
@@ -333,6 +333,22 @@ class RewardsCfg:
     # )
     # -- optional penalties
     # dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=0.0)
+    # raibert = RewTerm(
+    #     func=mdp.raibert_foot_placement_reward,
+    #     weight=-1.0e-5,
+    #     params={
+    #         "command_name": "base_velocity",
+    #         "asset_cfg": SceneEntityCfg("robot", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"]),
+    #         "stance_time": 0.20,
+    #         "nominal_foot_positions_xy": [
+    #             [ 0.20,  0.13],
+    #             [ 0.20, -0.13],
+    #             [-0.20,  0.13],
+    #             [-0.20, -0.13],
+    #         ],
+    #         "vel_gain": 0.05,
+    #     },
+    # )
 
 
 @configclass
@@ -352,18 +368,18 @@ class CurriculumCfg:
 
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
 
-    # actuator_faults = CurrTerm(
-    #     func=mdp.actuator_fault_event_schedule,
-    #     params={
-    #         "start_ratio": 0.5,
-    #         "end_ratio": 1.0,
-    #         "start_failure_range": (0.3, 0.8),
-    #         "end_failure_range": (0.1, 0.6),
-    #         "num_epochs": 2000,
-    #         "steps_per_iteration": 24,
-    #         "event_name": "randomize_actuator_faults",
-    #     },
-    # )
+    actuator_faults = CurrTerm(
+        func=mdp.actuator_fault_event_schedule,
+        params={
+            "start_ratio": 0.5,
+            "end_ratio": 1.0,
+            "start_failure_range": (0.3, 0.8),
+            "end_failure_range": (0.1, 0.6),
+            "num_epochs": 2000,
+            "steps_per_iteration": 24,
+            "event_name": "randomize_actuator_faults",
+        },
+    )
 
 
 ##

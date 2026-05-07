@@ -151,21 +151,21 @@ class UnitreeGo2RoughFTNetEnvCfg_PLAY(UnitreeGo2RoughFTNetEnvCfg):
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
-        self.events.randomize_actuator_faults.params["ratio"] = 1.0
-        self.events.randomize_actuator_faults.params["failure_range"] = (0.0, 0.01)
-        self.events.randomize_actuator_faults.params["num_faults"] = 1
-        self.events.randomize_actuator_faults.interval_range_s=(3.0, 5.0)
+        # self.events.randomize_actuator_faults.params["ratio"] = 1.0
+        # self.events.randomize_actuator_faults.params["failure_range"] = (0.0, 0.01)
+        # self.events.randomize_actuator_faults.params["num_faults"] = 1
+        # self.events.randomize_actuator_faults.interval_range_s=(3.0, 5.0)
         # self.events.randomize_actuator_faults = None
         # make a smaller scene for play
-        self.scene.num_envs = 50
+        self.scene.num_envs = 100
         self.scene.env_spacing = 2.5
         # spawn the robot randomly in the grid (instead of their terrain levels)
         self.scene.terrain.max_init_terrain_level = None
         # reduce the number of terrains to save memory
         if self.scene.terrain.terrain_generator is not None:
-            self.scene.terrain.terrain_generator.num_rows = 5
-            self.scene.terrain.terrain_generator.num_cols = 5
-            self.scene.terrain.terrain_generator.curriculum = False
+            self.scene.terrain.terrain_generator.num_rows = 10
+            self.scene.terrain.terrain_generator.num_cols = 10
+            self.scene.terrain.terrain_generator.curriculum = True
 
         # disable randomization for play
         self.observations.policy.enable_corruption = False
