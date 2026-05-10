@@ -686,7 +686,7 @@ class PPODreamFLEX(PPO):
                         param_group["lr"] = self.learning_rate
             # Encoder loss
             code, code_vel, decode, mean_vel, logvar_vel, mean_latent, logvar_latent, fault_logit = latent_outputs
-            vel_target = batch.observations['critic'][:,-35:-32]
+            vel_target = batch.observations['critic'][:,49:52]
             fault_label_target = batch.observations['critic'][:,-12:]
             decode_target = batch.next_observations['policy']
             vel_target.requires_grad = False

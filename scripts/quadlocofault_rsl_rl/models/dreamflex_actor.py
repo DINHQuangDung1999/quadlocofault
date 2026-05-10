@@ -51,6 +51,7 @@ class DreamFLEXActor(nn.Module):
         # breakpoint()
         # Resolve observation groups and dimensions
         self.obs_hist_length, self.obs_dim = obs['history'].shape[1:]
+        self.priv_obs_dim = obs['critic'].shape[1]
         self.latent_dim = latent_dim
         self.action_dim = output_dim
         self.encoder_out_dim = 3 + self.action_dim + self.latent_dim # 3 + 12 + 16,

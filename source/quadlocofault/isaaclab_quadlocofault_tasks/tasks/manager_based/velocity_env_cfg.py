@@ -289,12 +289,12 @@ class RewardsCfg:
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.01)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.02)
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.2)
+    
     # dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-2.0e-5)
     # dof_power_l2 = RewTerm(func=mdp.joint_power, weight=-2.0e-5)
     base_height_l2 = RewTerm(
         func=mdp.base_height_l2, 
-        weight=-5.0,
+        weight=-1.0,
         params={
             "target_height": 0.4,
             "asset_cfg": SceneEntityCfg("robot"),
@@ -309,22 +309,75 @@ class RewardsCfg:
             "threshold": 0.5,
         },
     )
-    foot_clearance = RewTerm(
-        func=mdp.foot_clearance_reward,
-        weight=-0.5,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
-            "target_height": 0.15,
-        },
-    )
-    joint_motion = RewTerm(func=mdp.joint_motion_cosmetic, weight=-1.0)
+
+@configclass
+class FTNetRewardsCfg(RewardsCfg):
     VHIP_style = RewTerm(
-        func=mdp.VHIP_style_reward, 
+        func=mdp.vhip_style_reward_ftnet, 
         weight=-1.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces"),
             "asset_cfg": SceneEntityCfg("robot"),
+            "contact_threshold": 1.0,
+            "theta_scale": -0.015,
+            "theta_ddot_scale": -0.01,
+            "support_dist_scale": -0.01,
         })
+@configclass
+class DreamFLEXRewardsCfg(RewardsCfg):
+    power_distribution = RewTerm(
+        func=mdp.power_distribution,
+        weight=-1e-5
+    )
+    joint_power = RewTerm(
+        func=mdp.joint_power,
+        weight=-2e-5
+    )
+    flat_orientation_l2 = RewTerm(
+        func=mdp.flat_orientation_l2, 
+        weight=-0.2)
+    foot_clearance = RewTerm(
+        func=mdp.foot_clearance_reward_dreamflex,
+        weight=-0.5,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "target_height": 0.12,
+        },
+    )
+    raibert = RewTerm(
+        func=mdp.raibert_foot_placement_reward,
+        weight=-1.0e-5,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"]),
+            "stance_time": 0.20,
+            "nominal_foot_positions_xy": [
+                [0.20,  0.13],
+                [0.20, -0.13],
+                [-0.20,  0.13],
+                [-0.20, -0.13],
+            ],
+            "vel_gain": 0.05,
+        },
+    )
+
+    fault_leg_motion = RewTerm(
+        func=mdp.faulty_joint_motion_reward_dreamflex,
+        weight=-0.2,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+        },
+    )
+    faulty_leg_contact = RewTerm(
+        func=mdp.faulty_leg_contact_reward,
+        weight=-0.1,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+            "asset_cfg": SceneEntityCfg("robot"),
+            "threshold": 1.0,
+        },
+    )
+    # joint_motion = RewTerm(func=mdp.joint_motion_cosmetic, weight=-1.0)
     # power_distribution = RewTerm(func=mdp.power_distribution, weight=-1e-5)
     # undesired_contacts = RewTerm(
     #     func=mdp.undesired_contacts,
@@ -475,13 +528,24 @@ class LocomotionVelocityRoughEnvCfg(ManagerBasedRLEnvCfg):
 @configclass
 class LocomotionVelocityRoughFTNetEnvCfg(LocomotionVelocityRoughEnvCfg):
     priv_motors_info: bool = True
-    pass
+    # rewards = FTNetRewardsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.feet_air_time.weight = 1.5
+        return 
+
 @configclass
 class LocomotionVelocityRoughPINNEnvCfg(LocomotionVelocityRoughEnvCfg):
     priv_motors_info: bool = True
-    pass
 
 @configclass
 class LocomotionVelocityRoughFLEXEnvCfg(LocomotionVelocityRoughEnvCfg):
     priv_motors_info: bool = True
-    pass
+
+    # rewards = DreamFLEXRewardsCfg ()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.feet_air_time.weight = 1.5
+        return 

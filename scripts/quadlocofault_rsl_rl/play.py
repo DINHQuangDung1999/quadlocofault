@@ -246,7 +246,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # breakpoint()
             # obs_policy, obs_hist = obs['policy'], obs['history']
             # actions, _ = policy(obs_policy, obs_hist)
-            actions, _ = policy(obs)
+            outputs = policy(obs)
+            if isinstance(outputs, tuple):
+                actions, _ = outputs 
+            else:
+                actions = outputs
             # env stepping
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated

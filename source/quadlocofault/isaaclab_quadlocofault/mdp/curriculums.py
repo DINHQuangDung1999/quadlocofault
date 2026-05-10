@@ -54,6 +54,64 @@ def terrain_levels_vel(
     # return the mean terrain level
     return torch.mean(terrain.terrain_levels.float())
 
+
+def terrain_levels_episode_reward(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    reward_threshold: float,
+    move_down_threshold: float | None = None,
+    reward_term_names: Sequence[str] | None = None,
+    normalize_by_episode_length: bool = False,
+) -> dict[str, float]:
+    """Curriculum based on accumulated episodic reward instead of traveled distance.
+
+    This avoids promoting agents that merely slide or fall a long distance on sloped terrain.
+
+    Args:
+        env: The RL environment.
+        env_ids: Environment indices to update.
+        reward_threshold: Episodic reward threshold above which environments move to harder terrain.
+        move_down_threshold: Episodic reward threshold below which environments move to easier terrain.
+            If omitted, defaults to half of ``reward_threshold``.
+        reward_term_names: Optional subset of reward terms to accumulate. If omitted, all active reward
+            terms are summed.
+        normalize_by_episode_length: Whether to divide the episodic reward by ``env.max_episode_length_s``
+            before thresholding.
+
+    Returns:
+        Logging dictionary with the mean terrain level and mean episodic reward of the selected environments.
+    """
+    terrain: TerrainImporter = env.scene.terrain
+    if move_down_threshold is None:
+        move_down_threshold = 0.5 * reward_threshold
+
+    env_ids_tensor = torch.as_tensor(env_ids, device=terrain.device, dtype=torch.long)
+    episode_reward = torch.zeros(len(env_ids_tensor), device=terrain.device)
+
+    if reward_term_names is None:
+        reward_term_names = tuple(env.reward_manager._episode_sums.keys())
+
+    for term_name in reward_term_names:
+        if term_name not in env.reward_manager._episode_sums:
+            raise ValueError(f"Reward term '{term_name}' not found in reward manager episode sums.")
+        episode_reward += env.reward_manager._episode_sums[term_name][env_ids_tensor]
+
+    if normalize_by_episode_length:
+        episode_reward = episode_reward / env.max_episode_length_s
+
+    move_up = episode_reward > reward_threshold
+    move_down = episode_reward < move_down_threshold
+    move_down *= ~move_up
+
+    terrain.update_env_origins(env_ids_tensor, move_up, move_down)
+
+    return {
+        "mean_episode_reward": float(torch.mean(episode_reward).item()),
+        "mean_terrain_level": float(torch.mean(terrain.terrain_levels[env_ids_tensor].float()).item()),
+        "move_up_ratio": float(move_up.float().mean().item()),
+        "move_down_ratio": float(move_down.float().mean().item()),
+    }
+
 def actuator_fault_event_schedule(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
