@@ -227,3 +227,65 @@ class RslRlPINNActorCfg:
         output_channels: tuple[int] | list[int] = MISSING
         """The number of output channels for each convolutional layer for the CNN."""
 
+@configclass
+class RslRlGCNActorCfg:
+    """Configuration for the GCNActor model."""
+
+    class_name: str = "GCNActor"
+    """The model class name. Defaults to MLPModel."""
+
+    actor_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the MLP Actor network."""
+
+    # hist_encoder_hidden_dims: int | tuple[int] | list[int] = MISSING
+    # """The hidden dimensions of the MLP history encoder network."""
+    
+    # latent_decoder_hidden_dims: int | tuple[int] | list[int] = MISSING
+    # """The hidden dimensions of the MLP next state regressor network."""
+    
+    # fault_decoder_hidden_dims: int | tuple[int] | list[int] = MISSING
+    # """The hidden dimensions of the MLP fault modulation network."""
+
+    # latent_dim: int = MISSING
+    # """The dimension of the latent space."""
+
+    activation: str = MISSING
+    """The activation function for the MLP Actor network."""
+
+    obs_normalization: bool = False
+    """Whether to normalize the observation for the model. Defaults to False."""
+
+    distribution_cfg: DistributionCfg | None = None
+    """The configuration for the output distribution of Actor. Defaults to None, in which case no distribution is used."""
+
+    @configclass
+    class DistributionCfg:
+        """Configuration for the output distribution."""
+
+        class_name: str = MISSING
+        """The distribution class name."""
+
+    @configclass
+    class GaussianDistributionCfg(DistributionCfg):
+        """Configuration for the Gaussian output distribution."""
+
+        class_name: str = "GaussianDistribution"
+        """The distribution class name. Default is GaussianDistribution."""
+
+        init_std: float = MISSING
+        """The initial standard deviation of the output distribution."""
+
+        std_type: Literal["scalar", "log"] = "scalar"
+        """The parameterization type of the output distribution's standard deviation. Default is scalar."""
+
+    @configclass
+    class HeteroscedasticGaussianDistributionCfg(GaussianDistributionCfg):
+        """Configuration for the heteroscedastic Gaussian output distribution."""
+
+        class_name: str = "HeteroscedasticGaussianDistribution"
+        """The distribution class name. Default is HeteroscedasticGaussianDistribution."""
+
+
+        output_channels: tuple[int] | list[int] = MISSING
+        """The number of output channels for each convolutional layer for the CNN."""
+

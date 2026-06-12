@@ -37,7 +37,7 @@ class CustomManagerBasedRLEnv(CustomManagerBasedEnv, gym.Env):
         self.metadata["render_fps"] = 1 / self.step_dt
         print("[INFO]: Completed setting up the environment...")
         self.dataset = []
-        self.dataset_length = int(self.cfg.episode_length_s/self.cfg.sim.dt)
+        self.dataset_length = 5*int(self.cfg.episode_length_s/self.cfg.sim.dt)
         
     def load_managers(self):
         # note: this order is important since observation manager needs to know the command and action managers
@@ -115,9 +115,19 @@ class CustomManagerBasedRLEnv(CustomManagerBasedEnv, gym.Env):
             self.scene.update(dt=self.physics_dt)
             
             if self.cfg.run_data_collection:
+                dones = (self.termination_manager.terminated | self.termination_manager.time_outs).to(dtype=torch.float)
                 data_sample = torch.concat((self.scene["robot"].data.joint_pos, 
-                                            self.scene["robot"].data.joint_vel, 
-                                            self.scene["robot"].data.applied_torque), dim = -1)
+                                            self.scene["robot"].data.joint_vel,                  
+                                            self.scene["robot"].data.root_ang_vel_b,
+                                            self.scene["robot"].data.projected_gravity_b,
+                                            self.command_manager.get_command('base_velocity'),
+                                            self.action_manager.get_term("joint_pos").raw_actions,  
+                                            self.scene["robot"].faulty_joint_idx.clone(),
+                                            self.scene["robot"].data.applied_torque,   
+                                            self.asset.data.root_lin_vel_b,
+                                            self.motors_strength,
+                                            dones.unsqueeze(-1),
+                                            ), dim = -1)
                 self.dataset.append(data_sample)
                 if len(self.dataset) % 1000 == 0:
                     print(f'{len(self.dataset)} / {self.dataset_length} steps collected.')

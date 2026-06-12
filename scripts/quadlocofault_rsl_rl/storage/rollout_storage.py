@@ -130,6 +130,7 @@ class RolloutStorage:
 
             self.masks: torch.Tensor | None = masks
             """Batch of trajectory masks for recurrent networks (RL recurrent only)."""
+
     
     def __init__(
         self,

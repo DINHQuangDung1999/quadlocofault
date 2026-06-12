@@ -10,16 +10,32 @@ import time
 import torch
 
 import rsl_rl
-from algorithms import PPO, PPOFTNet, PPOPINN, PPODreamFLEX
+from algorithms import PPO, PPOFTNet, PPOPINN, PPODreamFLEX, PPOGCN
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.env import VecEnv
 from rsl_rl.utils import check_nan, resolve_callable
 from rsl_rl.utils.logger import Logger
 
+def check_finite(obs, rewards: torch.Tensor, dones: torch.Tensor) -> None:
+    """Raise ``ValueError`` if any environment output contains NaN or Inf."""
+    for key, tensor in obs.items():
+        if not torch.isfinite(tensor).all():
+            raise ValueError(
+                f"The observation group '{key}' returned by the environment contains non-finite values."
+            )
+    if not torch.isfinite(rewards).all():
+        raise ValueError(
+            "The rewards returned by the environment contain non-finite values."
+        )
+    if not torch.isfinite(dones).all():
+        raise ValueError(
+            "The dones returned by the environment contain non-finite values."
+        )
+
 class CustomOnPolicyRunner(OnPolicyRunner):
     """Custom On-policy runner for training and evaluation."""
 
-    alg: PPOFTNet | PPOPINN | PPODreamFLEX
+    alg: PPOFTNet | PPOPINN | PPODreamFLEX | PPOGCN
     """The actor-critic algorithm."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
@@ -27,7 +43,7 @@ class CustomOnPolicyRunner(OnPolicyRunner):
         self.env = env
         self.cfg = train_cfg
         self.device = device
-
+        
         # Setup multi-GPU training if enabled
         self._configure_multi_gpu()
 
@@ -39,9 +55,10 @@ class CustomOnPolicyRunner(OnPolicyRunner):
                         "PPOFTNet": PPOFTNet,
                         "PPOPINN": PPOPINN,
                         "PPODreamFLEX": PPODreamFLEX,
+                        "PPOGCN": PPOGCN,
                     }
         # Create the algorithm
-        alg_class: PPOFTNet | PPOPINN | PPODreamFLEX = algorithms[self.cfg["algorithm"]["class_name"]]
+        alg_class: PPOFTNet | PPOPINN | PPODreamFLEX | PPOGCN = algorithms[self.cfg["algorithm"]["class_name"]]
         self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
 
         # Create the logger
@@ -68,6 +85,7 @@ class CustomOnPolicyRunner(OnPolicyRunner):
 
         # Start learning
         obs = self.env.get_observations().to(self.device)
+        check_finite(obs, torch.zeros(self.env.num_envs, device=obs.device), torch.zeros(self.env.num_envs, device=obs.device))
         self.alg.train_mode()  # switch to train mode (for dropout for example)
 
         # Ensure all parameters are in-synced
@@ -93,6 +111,7 @@ class CustomOnPolicyRunner(OnPolicyRunner):
                     # Check for NaN values from the environment
                     if self.cfg.get("check_for_nan", True):
                         check_nan(obs, rewards, dones)
+                        check_finite(obs, rewards, dones)
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # Process the step

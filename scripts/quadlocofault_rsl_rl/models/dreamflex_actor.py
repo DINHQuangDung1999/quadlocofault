@@ -51,6 +51,7 @@ class DreamFLEXActor(nn.Module):
         # breakpoint()
         # Resolve observation groups and dimensions
         self.obs_hist_length, self.obs_dim = obs['history'].shape[1:]
+        self.priv_obs_dim = obs['critic'].shape[1]
         self.latent_dim = latent_dim
         self.action_dim = output_dim
         self.encoder_out_dim = 3 + self.action_dim + self.latent_dim # 3 + 12 + 16,
@@ -59,9 +60,11 @@ class DreamFLEXActor(nn.Module):
         self.obs_normalization = obs_normalization
         if obs_normalization:
             self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
-            self.obs_hist_normalizer = EmpiricalNormalization(self.obs_dim)
+            self.critic_obs_normalizer = EmpiricalNormalization(self.priv_obs_dim)
+            self.obs_hist_normalizer = EmpiricalNormalization([self.obs_hist_length, self.obs_dim])
         else:
             self.obs_normalizer = torch.nn.Identity()
+            self.critic_obs_normalizer = torch.nn.Identity()
             self.obs_hist_normalizer = torch.nn.Identity()
 
         # Distribution
@@ -105,8 +108,7 @@ class DreamFLEXActor(nn.Module):
         obs: TensorDict,
         masks: torch.Tensor | None = None,
         hidden_state: HiddenState = None,
-        stochastic_output: bool = False,
-        return_latent: bool = False
+        stochastic_output: bool = False
     ) -> torch.Tensor:
         """Forward pass of the MLP model.
 
@@ -140,7 +142,7 @@ class DreamFLEXActor(nn.Module):
         """Build the model latent by concatenating and normalizing selected observation groups."""
         # Select and concatenate observations
         # Normalize observations
-        obs_hist = self.obs_hist_normalizer(obs['history'].flatten(1,2))
+        obs_hist = self.obs_hist_normalizer(obs['history']).flatten(1,2)
         distribution = self.hist_encoder_mlp(obs_hist)
 
         mean_latent = self.mean_latent_encoder_mlp(distribution)
@@ -160,13 +162,13 @@ class DreamFLEXActor(nn.Module):
         # fault_binarylabel = torch.zeros_like(fault_logit).to(fault_logit.device)
         # fault_binarylabel[torch.arange(fault_binarylabel.shape[0]), fault_label] = 1.
 
-        gamma = self.fault_decoder_mlp(fault_logit)
+        gamma = self.fault_decoder_mlp(torch.sigmoid(fault_logit))
 
         decode = self.latent_decoder_mlp(code_latent)
         
         code_latent = gamma[:,:self.latent_dim] * code_latent + gamma[:,self.latent_dim:]
 
-        code = torch.cat((code_vel, fault_logit, code_latent),dim=-1)
+        code = torch.cat((code_vel, torch.sigmoid(fault_logit), code_latent),dim=-1)
 
         # decode = self.latent_decoder_mlp(code_latent)
 
@@ -228,6 +230,7 @@ class DreamFLEXActor(nn.Module):
         if self.obs_normalization:
             # Update the normalizer parameters
             self.obs_normalizer.update(obs['policy'])  # type: ignore
+            self.critic_obs_normalizer.update(obs['critic'])
             self.obs_hist_normalizer.update(obs['history'])
 
 

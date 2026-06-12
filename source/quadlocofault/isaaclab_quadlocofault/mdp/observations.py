@@ -26,6 +26,11 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 
 
+def _safe_obs_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Replace NaN/Inf in observation tensors before they reach normalization or PPO."""
+    return torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 class CustomProprioceptiveObservations(ManagerTermBase):
 
     def __init__(self, cfg: ObservationTermCfg, 
@@ -41,7 +46,7 @@ class CustomProprioceptiveObservations(ManagerTermBase):
         self.asset_cfg = cfg.params["asset_cfg"]
         self._prev_action = torch.zeros(self.num_envs, self.num_action, device=self.device)
 
-        self.foot_ids, _ = self.asset.find_bodies(".*_foot", preserve_order=True)
+        self.foot_ids, _ = self.contact_sensor.find_bodies(".*_foot", preserve_order=True)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         self._prev_action[env_ids, :] = 0.
@@ -55,7 +60,7 @@ class CustomProprioceptiveObservations(ManagerTermBase):
 
         forces_w = self.contact_sensor.data.net_forces_w
         foot_forces_w = forces_w[:, self.foot_ids, :]
-        foot_contact_boolean = torch.where(foot_forces_w.norm(dim=-1) > 0.0, 1.0, 0.0)
+        foot_contact_boolean = torch.where(foot_forces_w.norm(dim=-1) > 1.0, 1.0, 0.0)
         commands = env.command_manager.get_command('base_velocity')
         action = env.action_manager.get_term("joint_pos").raw_actions
 
@@ -70,7 +75,7 @@ class CustomProprioceptiveObservations(ManagerTermBase):
                             ),dim=-1)
 
         self._prev_action = action
-        return prop_obs
+        return _safe_obs_tensor(prop_obs)
 
 class CustomPrivilegedObservations(ManagerTermBase):
 
@@ -93,7 +98,7 @@ class CustomPrivilegedObservations(ManagerTermBase):
         self.faulty_joint_idx = torch.zeros(self.num_envs, self.num_action, device=self.device)
 
         self.body_id = self.asset.find_bodies('base')[0]
-        self.foot_ids, _ = self.asset.find_bodies(".*_foot", preserve_order=True)
+        self.foot_ids, _ = self.contact_sensor.find_bodies(".*_foot", preserve_order=True)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         self._prev_action[env_ids, :] = 0.
@@ -107,7 +112,7 @@ class CustomPrivilegedObservations(ManagerTermBase):
 
         forces_w = self.contact_sensor.data.net_forces_w
         foot_forces_w = forces_w[:, self.foot_ids, :]
-        foot_contact_boolean = torch.where(foot_forces_w.norm(dim=-1) > 0.0, 1.0, 0.0)        
+        foot_contact_boolean = torch.where(foot_forces_w.norm(dim=-1) > 1.0, 1.0, 0.0)        
         commands = env.command_manager.get_command('base_velocity')
         action = env.action_manager.get_term("joint_pos").raw_actions
         measured_heights = self._get_heights()
@@ -130,7 +135,7 @@ class CustomPrivilegedObservations(ManagerTermBase):
                                   ],dim=-1)
 
         self._prev_action = action
-        return observations 
+        return _safe_obs_tensor(observations) 
     
     def _get_priv_phys(
         self,
@@ -157,17 +162,22 @@ class CustomPrivilegedObservations(ManagerTermBase):
             friction_coeffs_tensor.unsqueeze(1).to(self.device),
             # self._prev_motors_strength,
             # self._prev_faulty_joint_idx,
-            applied_torque,
+            # applied_torque,
             # default_stiffness,
             # default_damping,
             self.motors_strength,
             self.faulty_joint_idx,
         ), dim=-1).to(self.device)    
         # breakpoint()
-        return priv_phys
+        return _safe_obs_tensor(priv_phys) # 3 + 4 + 1 + 12 + 12
     
     def _get_heights(self):
-        return torch.clip(self.ray_sensor.data.pos_w[:, 2].unsqueeze(1) - self.ray_sensor.data.ray_hits_w[..., 2] - 0.3, -1, 1).to(self.device)
+        heights = torch.clip(
+            self.ray_sensor.data.pos_w[:, 2].unsqueeze(1) - self.ray_sensor.data.ray_hits_w[..., 2] - 0.3,
+            -1,
+            1,
+        ).to(self.device)
+        return _safe_obs_tensor(heights)
 
 class CustomProprioceptionHistory(ManagerTermBase):
 
@@ -190,7 +200,7 @@ class CustomProprioceptionHistory(ManagerTermBase):
         self._prev_action = torch.zeros(self.num_envs, self.num_action, device=self.device)
 
         self.body_id = self.asset.find_bodies('base')[0]
-        self.foot_ids, _ = self.asset.find_bodies(".*_foot", preserve_order=True)
+        self.foot_ids, _ = self.contact_sensor.find_bodies(".*_foot", preserve_order=True)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         self._obs_history_buffer[env_ids, :, :] = 0. 
@@ -206,7 +216,7 @@ class CustomProprioceptionHistory(ManagerTermBase):
 
         forces_w = self.contact_sensor.data.net_forces_w
         foot_forces_w = forces_w[:, self.foot_ids, :]
-        foot_contact_boolean = torch.where(foot_forces_w.norm(dim=-1) > 0.0, 1.0, 0.0)
+        foot_contact_boolean = torch.where(foot_forces_w.norm(dim=-1) > 1.0, 1.0, 0.0)
         commands = env.command_manager.get_command('base_velocity')
         action = env.action_manager.get_term("joint_pos").raw_actions
 
@@ -229,5 +239,62 @@ class CustomProprioceptionHistory(ManagerTermBase):
             ], dim=1)
         )
         self._prev_action = action
-        return self._obs_history_buffer[:, -num_hist:]
+        return _safe_obs_tensor(self._obs_history_buffer[:, -num_hist:])
         
+
+
+        friction_coeffs_tensor = self.asset.root_physx_view.get_material_properties()[:, 0, 0]
+        if hasattr(self.asset, "motors_strength"):
+            self.motors_strength = self.asset.motors_strength.clone()
+        if hasattr(self.asset, "faulty_joint_idx"):
+            self.faulty_joint_idx = self.asset.faulty_joint_idx.clone()
+        applied_torque = self.asset.data.applied_torque.clone()
+        # breakpoint()
+        # default_stiffness = self.asset.data.default_joint_stiffness[:,:1]
+        # default_damping = self.asset.data.default_joint_damping[:,:1]
+        priv_phys = torch.cat((
+            body_lin_vel,
+            # ex_force,
+            mass_params_tensor,
+            friction_coeffs_tensor.unsqueeze(1).to(self.device),
+            # self._prev_motors_strength,
+            # self._prev_faulty_joint_idx,
+            # applied_torque,
+            # default_stiffness,
+            # default_damping,
+            self.motors_strength,
+            self.faulty_joint_idx,
+        ), dim=-1).to(self.device)    
+        # breakpoint()
+        return _safe_obs_tensor(priv_phys) # 3 + 4 + 1 + 12 + 12
+
+def body_mass_params(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+    asset: Articulation = env.scene[asset_cfg.name]
+    body_id = asset.find_bodies('base')[0]
+    body_mass = asset.root_physx_view.get_masses()[:,body_id].to(asset.device)
+    body_com = asset.data.com_pos_b[:,body_id,:].squeeze(1)
+    mass_params_tensor = torch.cat([body_mass, body_com],dim=-1)
+    return mass_params_tensor
+
+def friction_coeffs(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+    asset: Articulation = env.scene[asset_cfg.name]
+    friction_coeffs_tensor = asset.root_physx_view.get_material_properties()[:, 0, 0].unsqueeze(1).to(asset.device)
+    return friction_coeffs_tensor
+
+def motor_strengths(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+    # breakpoint()
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(asset, "motors_strength"):
+        motors_strength = asset.motors_strength.clone()
+    else:
+        motors_strength = torch.ones(env.num_envs, asset.num_joints, device=asset.device, dtype=torch.float32)
+    return motors_strength
+
+def faulty_joints(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")):
+    # breakpoint()
+    asset: Articulation = env.scene[asset_cfg.name]
+    if hasattr(asset, "faulty_joint_idx"):
+        faulty_joint = asset.faulty_joint_idx.clone()
+    else:
+        faulty_joint = torch.zeros(env.num_envs, asset.num_joints, device=asset.device, dtype=torch.float32)
+    return faulty_joint

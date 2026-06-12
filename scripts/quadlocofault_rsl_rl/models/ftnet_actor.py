@@ -72,8 +72,8 @@ class FTNetActor(nn.Module):
         self.obs_normalization = obs_normalization
         if obs_normalization:
             self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
-            self.critic_obs_normalizer = EmpiricalNormalization(self.obs_dim)
-            self.obs_hist_normalizer = EmpiricalNormalization(self.obs_dim)
+            self.critic_obs_normalizer = EmpiricalNormalization(self.priv_obs_dim)
+            self.obs_hist_normalizer = EmpiricalNormalization([self.obs_hist_length, self.obs_dim])
         else:
             self.obs_normalizer = torch.nn.Identity()
             self.critic_obs_normalizer = torch.nn.Identity()
@@ -212,7 +212,7 @@ class FTNetActor(nn.Module):
 
     def as_onnx(self, verbose: bool) -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
-        return _OnnxMLPModel(self, verbose)
+        return _OnnxMLPActor(self, verbose)
 
     def update_normalization(self, obs: TensorDict) -> None:
         """Update observation-normalization statistics from a batch of observations."""
@@ -256,7 +256,7 @@ class _TorchFTNetActor(nn.Module):
         pass
 
 
-class _OnnxMLPModel(nn.Module):
+class _OnnxMLPActor(nn.Module):
     """Exportable CNN model for ONNX."""
 
     def __init__(self, model: FTNetActor, verbose: bool) -> None:
