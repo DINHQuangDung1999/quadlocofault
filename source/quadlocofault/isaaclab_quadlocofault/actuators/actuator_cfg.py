@@ -6,7 +6,7 @@
 from collections.abc import Iterable
 
 from isaaclab.utils import configclass
-from isaaclab.actuators.actuator_cfg import DCMotorCfg
+from isaaclab.actuators.actuator_cfg import DCMotorCfg, DelayedPDActuatorCfg
 from . import actuator_pd
 
 @configclass
@@ -15,4 +15,13 @@ class CustomDCMotorCfg(DCMotorCfg):
     class_type: type = actuator_pd.CustomDCMotor
 
     saturation_effort: dict[str, float] | None = None
+    """Peak motor force/torque of the electric DC motor (in N-m)."""
+
+
+@configclass
+class DelayedCustomDCMotorCfg(DelayedPDActuatorCfg):
+
+    class_type: type = actuator_pd.DelayedCustomDCMotor
+
+    saturation_effort: dict[str, float] | float | None = None
     """Peak motor force/torque of the electric DC motor (in N-m)."""

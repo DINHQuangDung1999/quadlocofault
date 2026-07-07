@@ -126,13 +126,10 @@ class FTNetActor(nn.Module):
         # breakpoint()
         # Get MLP input latent
         obs_policy = self.obs_normalizer(obs['policy'])
-        if self.training:
-            priv_latent = self.get_priv_latent(obs, masks, hidden_state)
-            hist_latent = self.get_hist_latent(obs, masks, hidden_state)
-            actor_input = torch.cat([priv_latent, obs_policy], dim = -1)
-        else:
-            hist_latent = self.get_hist_latent(obs, masks, hidden_state)
-            actor_input = torch.cat([hist_latent, obs_policy], dim = -1)
+
+        priv_latent = self.get_priv_latent(obs, masks, hidden_state)
+        hist_latent = self.get_hist_latent(obs, masks, hidden_state)
+        actor_input = torch.cat([hist_latent, obs_policy], dim = -1)
 
         # MLP forward pass
         # breakpoint()

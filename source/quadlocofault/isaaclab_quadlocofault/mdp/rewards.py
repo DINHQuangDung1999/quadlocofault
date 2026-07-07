@@ -118,17 +118,15 @@ def faulty_leg_contact_reward(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     threshold: float = 1.0,
 ) -> torch.Tensor:
-    """DreamFLEX-style penalty for ground contact on the faulty leg."""
     asset: Articulation = env.scene[asset_cfg.name]
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
 
-    body_names = [asset.body_names[body_id] for body_id in sensor_cfg.body_ids]
-    faulty_leg_mask = _get_faulty_leg_mask(asset, body_names)
+    foot_sensor_ids, foot_names = contact_sensor.find_bodies(".*_foot", preserve_order=True)
+    faulty_leg_mask = _get_faulty_leg_mask(asset, foot_names)
 
-    foot_contact_force = torch.norm(contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :], dim=-1)
+    foot_contact_force = torch.norm(contact_sensor.data.net_forces_w[:, foot_sensor_ids, :], dim=-1)
     faulty_contacts = (foot_contact_force > threshold).float() * faulty_leg_mask
     return torch.sum(faulty_contacts, dim=1)
-
 
 def feet_air_time(
     env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg, threshold: float

@@ -34,6 +34,25 @@ class UnitreeGo2PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+@configclass
+class UnitreeGo2RoughOraclePPORunnerCfg(UnitreeGo2PPORunnerCfg):
+    actor = RslRlMLPModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        obs_normalization=False,
+        distribution_cfg = RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0,
+                                                                    std_type="log")
+    )
+    critic = RslRlMLPModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        obs_normalization=False,
+        distribution_cfg = None
+    )
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.class_name = "PPO"
+        self.experiment_name = "unitree_go2_rough_oracle"
 
 @configclass
 class UnitreeGo2RoughPPORunnerCfg(UnitreeGo2PPORunnerCfg):
@@ -154,6 +173,12 @@ class UnitreeGo2RoughPPOGCNRunnerCfg(UnitreeGo2PPORunnerCfg):
         self.algorithm.class_name = "PPOGCN"
         self.experiment_name = "unitree_go2_rough_gcn"
 
+@configclass
+class UnitreeGo2FlatOraclePPORunnerCfg(UnitreeGo2RoughOraclePPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "unitree_go2_flat_oracle"
 
 @configclass
 class UnitreeGo2FlatPPORunnerCfg(UnitreeGo2RoughPPORunnerCfg):

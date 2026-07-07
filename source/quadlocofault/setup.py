@@ -17,7 +17,8 @@ EXTENSION_TOML_DATA = toml.load(os.path.join(EXTENSION_PATH, "config", "extensio
 
 # Minimum dependencies required prior to installation
 INSTALL_REQUIRES = [
-    # NOTE: Add dependencies
+    # Isaac Lab and parts of the surrounding stack still rely on NumPy 1.x internals.
+    "numpy<2",
     "psutil",
 ]
 

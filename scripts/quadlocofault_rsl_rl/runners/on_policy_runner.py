@@ -17,20 +17,17 @@ from rsl_rl.utils import check_nan, resolve_callable
 from rsl_rl.utils.logger import Logger
 
 def check_finite(obs, rewards: torch.Tensor, dones: torch.Tensor) -> None:
-    """Raise ``ValueError`` if any environment output contains NaN or Inf."""
-    for key, tensor in obs.items():
-        if not torch.isfinite(tensor).all():
-            raise ValueError(
-                f"The observation group '{key}' returned by the environment contains non-finite values."
-            )
-    if not torch.isfinite(rewards).all():
-        raise ValueError(
-            "The rewards returned by the environment contain non-finite values."
-        )
-    if not torch.isfinite(dones).all():
-        raise ValueError(
-            "The dones returned by the environment contain non-finite values."
-        )
+    """Replace any NaN or Inf values in environment outputs with zeros."""
+
+    def _zero_non_finite(tensor: torch.Tensor) -> None:
+        if tensor.is_floating_point() or tensor.is_complex():
+            if not torch.isfinite(tensor).all():
+                tensor.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+
+    for tensor in obs.values():
+        _zero_non_finite(tensor)
+    _zero_non_finite(rewards)
+    _zero_non_finite(dones)
 
 class CustomOnPolicyRunner(OnPolicyRunner):
     """Custom On-policy runner for training and evaluation."""

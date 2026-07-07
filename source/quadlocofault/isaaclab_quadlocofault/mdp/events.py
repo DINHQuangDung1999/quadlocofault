@@ -20,34 +20,6 @@ if TYPE_CHECKING:
     from isaaclab.envs import  ManagerBasedEnv
     from isaaclab.managers import EventTermCfg
 
-####################################
-####################################
-
-def set_actuator_faults(
-    env: ManagerBasedEnv,
-    env_ids: torch.Tensor | None,
-    asset_cfg: SceneEntityCfg,
-    joint: str | int | tuple,
-    ratio: float,    
-):
-    asset: Articulation = env.scene[asset_cfg.name]
-    # assert ((joint in asset.joint_names) or (joint < 12)), "must be a correct joint"
-    # ['FL_hip_joint', 'FR_hip_joint', 'RL_hip_joint', 
-    # 'RR_hip_joint', 'FL_thigh_joint', 'FR_thigh_joint', 
-    # 'RL_thigh_joint', 'RR_thigh_joint', 'FL_calf_joint', 
-    # 'FR_calf_joint', 'RL_calf_joint', 'RR_calf_joint']
-    if isinstance(joint, str):
-        joint = asset.joint_names.index(joint)
-    for actuator in asset.actuators.values():
-        # breakpoint()
-        asset.faulty_joint_idx[env_ids] = joint
-        
-        asset.motors_strength[env_ids] = asset.default_motors_strength[env_ids].clone()
-        asset.motors_strength[env_ids, joint] = ratio
-
-        actuator.stiffness[env_ids] = (asset.data.default_joint_stiffness * asset.motors_strength)[env_ids].clone()
-        actuator.damping[env_ids] = (asset.data.default_joint_damping * asset.motors_strength)[env_ids].clone()
-
 def randomize_actuator_faults(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,

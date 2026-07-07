@@ -10,11 +10,11 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import omni.log
-from isaaclab.actuators.actuator_pd import IdealPDActuator
+from isaaclab.actuators.actuator_pd import DelayedPDActuator, IdealPDActuator
 from isaaclab.utils.types import ArticulationActions
 
 if TYPE_CHECKING:
-    from .actuator_cfg import CustomDCMotorCfg
+    from .actuator_cfg import CustomDCMotorCfg, DelayedCustomDCMotorCfg
 
 
 class CustomDCMotor(IdealPDActuator):
@@ -78,3 +78,48 @@ class CustomDCMotor(IdealPDActuator):
         else:
             return super()._clip_effort(effort)
 
+
+class DelayedCustomDCMotor(DelayedPDActuator):
+    cfg: DelayedCustomDCMotorCfg
+
+    def __init__(self, cfg: DelayedCustomDCMotorCfg, *args, **kwargs):
+        super().__init__(cfg, *args, **kwargs)
+        if self.cfg.saturation_effort is not None:
+            if isinstance(self.cfg.saturation_effort, dict):
+                self._saturation_effort = self._parse_joint_parameter(
+                    self.cfg.saturation_effort, torch.zeros_like(self.computed_effort)
+                )
+            else:
+                self._saturation_effort = self.cfg.saturation_effort
+        else:
+            self._saturation_effort = torch.inf
+        self._joint_vel = torch.zeros_like(self.computed_effort)
+        self._zeros_effort = torch.zeros_like(self.computed_effort)
+
+    def compute(
+        self, control_action: ArticulationActions, joint_pos: torch.Tensor, joint_vel: torch.Tensor
+    ) -> ArticulationActions:
+        # Apply IsaacLab's built-in command delay before computing torques.
+        control_action.joint_positions = self.positions_delay_buffer.compute(control_action.joint_positions)
+        control_action.joint_velocities = self.velocities_delay_buffer.compute(control_action.joint_velocities)
+        control_action.joint_efforts = self.efforts_delay_buffer.compute(control_action.joint_efforts)
+
+        self._joint_vel[:] = joint_vel
+        error_pos = control_action.joint_positions - joint_pos
+        error_vel = control_action.joint_velocities - joint_vel
+        self.computed_effort = self.stiffness * error_pos + self.damping * error_vel + control_action.joint_efforts
+        self.applied_effort = self._clip_effort(self.computed_effort)
+        control_action.joint_efforts = self.applied_effort
+        control_action.joint_positions = None
+        control_action.joint_velocities = None
+        return control_action
+
+    def _clip_effort(self, effort: torch.Tensor) -> torch.Tensor:
+        if self.cfg.saturation_effort is not None:
+            max_effort = self._saturation_effort * (1.0 - self._joint_vel / self.velocity_limit)
+            max_effort = torch.clip(max_effort, min=self._zeros_effort, max=self.effort_limit)
+            min_effort = self._saturation_effort * (-1.0 - self._joint_vel / self.velocity_limit)
+            min_effort = torch.clip(min_effort, min=-self.effort_limit, max=self._zeros_effort)
+            return torch.clip(effort, min=min_effort, max=max_effort)
+        else:
+            return super()._clip_effort(effort)
