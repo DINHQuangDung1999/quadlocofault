@@ -173,6 +173,16 @@ class UnitreeGo2RoughPPOGCNRunnerCfg(UnitreeGo2PPORunnerCfg):
         self.algorithm.class_name = "PPOGCN"
         self.experiment_name = "unitree_go2_rough_gcn"
 
+
+@configclass
+class UnitreeGo2RoughPPOEquivGCNRunnerCfg(UnitreeGo2RoughPPOGCNRunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.actor.class_name = "EquivGCNActor"
+        self.algorithm.class_name = "PPOEquivGCN"
+        self.experiment_name = "unitree_go2_rough_equiv_gcn"
+
+
 @configclass
 class UnitreeGo2FlatOraclePPORunnerCfg(UnitreeGo2RoughOraclePPORunnerCfg):
     def __post_init__(self):
@@ -215,4 +225,3 @@ class UnitreeGo2FlatPPOGCNRunnerCfg(UnitreeGo2RoughPPOGCNRunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "unitree_go2_flat_gcn"
-

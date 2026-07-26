@@ -423,3 +423,17 @@ class UnitreeGo2RoughGCNEnvCfg_PLAY(UnitreeGo2RoughGCNEnvCfg):
         # remove random pushing event
         # self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+
+@configclass
+class UnitreeGo2RoughEquivGCNEnvCfg(UnitreeGo2RoughGCNEnvCfg):
+    """Rough-terrain configuration for the symmetry-biased GCN actor."""
+
+    pass
+
+
+@configclass
+class UnitreeGo2RoughEquivGCNEnvCfg_PLAY(UnitreeGo2RoughGCNEnvCfg_PLAY):
+    """Play configuration for the symmetry-biased GCN actor."""
+
+    pass

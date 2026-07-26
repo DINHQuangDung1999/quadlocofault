@@ -10,7 +10,7 @@ import time
 import torch
 
 import rsl_rl
-from algorithms import PPO, PPOFTNet, PPOPINN, PPODreamFLEX, PPOGCN
+from algorithms import PPO, PPOFTNet, PPOPINN, PPODreamFLEX, PPOGCN, PPOEquivGCN
 from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.env import VecEnv
 from rsl_rl.utils import check_nan, resolve_callable
@@ -32,7 +32,7 @@ def check_finite(obs, rewards: torch.Tensor, dones: torch.Tensor) -> None:
 class CustomOnPolicyRunner(OnPolicyRunner):
     """Custom On-policy runner for training and evaluation."""
 
-    alg: PPOFTNet | PPOPINN | PPODreamFLEX | PPOGCN
+    alg: PPOFTNet | PPOPINN | PPODreamFLEX | PPOGCN | PPOEquivGCN
     """The actor-critic algorithm."""
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
@@ -53,9 +53,12 @@ class CustomOnPolicyRunner(OnPolicyRunner):
                         "PPOPINN": PPOPINN,
                         "PPODreamFLEX": PPODreamFLEX,
                         "PPOGCN": PPOGCN,
+                        "PPOEquivGCN": PPOEquivGCN,
                     }
         # Create the algorithm
-        alg_class: PPOFTNet | PPOPINN | PPODreamFLEX | PPOGCN = algorithms[self.cfg["algorithm"]["class_name"]]
+        alg_class: PPOFTNet | PPOPINN | PPODreamFLEX | PPOGCN | PPOEquivGCN = algorithms[
+            self.cfg["algorithm"]["class_name"]
+        ]
         self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
 
         # Create the logger

@@ -21,7 +21,7 @@ from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
 from storage import RolloutStorage
 
 from rsl_rl.algorithms import PPO 
-from models import FTNetActor, DreamFLEXActor, PINNActor, GCNActor
+from models import FTNetActor, DreamFLEXActor, PINNActor, GCNActor, EquivGCNActor
 
 def get_grad_norm(parameters, norm_type=2):
     parameters = [p for p in parameters if p.grad is not None]
@@ -1241,12 +1241,14 @@ class PPOGCN(PPO):
             "PPODreamFLEX": PPODreamFLEX,
             "PPOPINN": PPOPINN,
             "PPOGCN": PPOGCN,
+            "PPOEquivGCN": PPOEquivGCN,
         }
         network_classes = {
             "FTNetActor": DreamFLEXActor,
             "DreamFLEXActor": DreamFLEXActor,
             "PINNActor": PINNActor,
             "GCNActor": GCNActor,
+            "EquivGCNActor": EquivGCNActor,
             "MLPModel": MLPModel
         }
         alg_class: type[PPOFTNet] = alg_classes[cfg["algorithm"].pop("class_name")]  # type: ignore
@@ -1704,3 +1706,9 @@ class PPOGCN(PPO):
             loss_dict["symmetry"] = mean_symmetry_loss
 
         return loss_dict
+
+
+class PPOEquivGCN(PPOGCN):
+    """PPOGCN variant selecting the symmetry-biased EquivGCNActor."""
+
+    actor: EquivGCNActor

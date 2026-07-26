@@ -9,5 +9,5 @@ class GCNLayer(nn.Module):
         self.linear = nn.Linear(in_dim, out_dim)
 
     def forward(self, x_nodes: torch.Tensor, adj_norm: torch.Tensor) -> torch.Tensor:
-        x = torch.einsum("ij,bljd->blid", adj_norm, x_nodes)
+        x = torch.einsum("ij,bjd->bid", adj_norm, x_nodes)
         return self.linear(x)
