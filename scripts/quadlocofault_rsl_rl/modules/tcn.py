@@ -15,22 +15,25 @@ class TemporalConvBlock(nn.Module):
             padding=0,
             dilation=dilation,
         )
-        self.conv2 = nn.Conv1d(
-            in_channels=out_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            padding=0,
-            dilation=dilation,
-        )
-        self.skip = nn.Identity() if in_channels == out_channels else nn.Conv1d(in_channels, out_channels, kernel_size=1)
-        self.norm1 = nn.BatchNorm1d(out_channels)
-        self.norm2 = nn.BatchNorm1d(out_channels)
+        # self.conv2 = nn.Conv1d(
+        #     in_channels=out_channels,
+        #     out_channels=out_channels,
+        #     kernel_size=kernel_size,
+        #     padding=0,
+        #     dilation=dilation,
+        # )
+        # self.skip = nn.Identity() if in_channels == out_channels else nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        # self.norm1 = nn.BatchNorm1d(out_channels)
+        # self.norm2 = nn.BatchNorm1d(out_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.skip(x)
+        # residual = self.skip(x)
         x = F.pad(x, (self.left_padding, 0))
-        x = F.relu(self.norm1(self.conv1(x)))
-        x = F.pad(x, (self.left_padding, 0))
-        x = self.norm2(self.conv2(x))
-        return F.relu(x + residual)
+        x = self.conv1(x)
+        return F.elu(x)
+        # x = self.norm1(self.conv1(x))
+        # x = F.elu(self.norm1(self.conv1(x)))
+        # x = F.pad(x, (self.left_padding, 0))
+        # x = self.norm2(self.conv2(x))
+        # return F.elu(x + residual)
 

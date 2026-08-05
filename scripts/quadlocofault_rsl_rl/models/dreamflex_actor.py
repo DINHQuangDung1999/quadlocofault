@@ -162,13 +162,13 @@ class DreamFLEXActor(nn.Module):
         # fault_binarylabel = torch.zeros_like(fault_logit).to(fault_logit.device)
         # fault_binarylabel[torch.arange(fault_binarylabel.shape[0]), fault_label] = 1.
 
-        gamma = self.fault_decoder_mlp(torch.sigmoid(fault_logit))
+        gamma = self.fault_decoder_mlp(torch.sigmoid(fault_logit.detach()))
 
         decode = self.latent_decoder_mlp(code_latent)
         
         code_latent = gamma[:,:self.latent_dim] * code_latent + gamma[:,self.latent_dim:]
 
-        code = torch.cat((code_vel, torch.sigmoid(fault_logit), code_latent),dim=-1)
+        code = torch.cat((code_vel, torch.sigmoid(fault_logit.detach()), code_latent),dim=-1)
 
         # decode = self.latent_decoder_mlp(code_latent)
 
@@ -236,16 +236,21 @@ class DreamFLEXActor(nn.Module):
 
 
 class _TorchDreamFLEXActor(nn.Module):
-    """Exportable CNN model for JIT."""
+    """TorchScript wrapper for the complete DreamFLEX inference path."""
 
     def __init__(self, model: DreamFLEXActor) -> None:
-        """Create a TorchScript-friendly copy of a CNNModel."""
+        """Copy the history encoder, latent heads, modulation, and actor."""
         super().__init__()
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
         self.obs_hist_normalizer = copy.deepcopy(model.obs_hist_normalizer)
-        # Convert ModuleDict to ModuleList for ordered iteration
         self.actor_mlp = copy.deepcopy(model.actor_mlp)
         self.hist_encoder_mlp = copy.deepcopy(model.hist_encoder_mlp)
+        self.mean_vel_encoder_mlp = copy.deepcopy(model.mean_vel_encoder_mlp)
+        self.mean_latent_encoder_mlp = copy.deepcopy(model.mean_latent_encoder_mlp)
+        self.logvar_latent_encoder_mlp = copy.deepcopy(model.logvar_latent_encoder_mlp)
+        self.fault_logit_encoder_mlp = copy.deepcopy(model.fault_logit_encoder_mlp)
+        self.fault_decoder_mlp = copy.deepcopy(model.fault_decoder_mlp)
+        self.latent_dim = model.latent_dim
         if model.distribution is not None:
             self.deterministic_output = model.distribution.as_deterministic_output_module()
         else:
@@ -253,9 +258,24 @@ class _TorchDreamFLEXActor(nn.Module):
 
     def forward(self, obs: torch.Tensor, obs_hist: torch.Tensor) -> torch.Tensor:
         obs = self.obs_normalizer(obs)
-        obs_hist = self.obs_hist_normalizer(obs_hist)
-        hist_latent = self.hist_encoder_cnn(obs_hist)
-        actor_input = torch.cat([hist_latent, obs], dim = -1)
+        obs_hist = self.obs_hist_normalizer(obs_hist).flatten(1, 2)
+        distribution = self.hist_encoder_mlp(obs_hist)
+
+        code_vel = self.mean_vel_encoder_mlp(distribution)
+        mean_latent = self.mean_latent_encoder_mlp(distribution)
+        logvar_latent = self.logvar_latent_encoder_mlp(distribution)
+        latent_std = torch.exp(0.5 * logvar_latent)
+        code_latent = mean_latent + latent_std * torch.randn_like(latent_std)
+
+        fault_probability = torch.sigmoid(self.fault_logit_encoder_mlp(distribution))
+        gamma_beta = self.fault_decoder_mlp(fault_probability)
+        code_latent = (
+            gamma_beta[:, : self.latent_dim] * code_latent
+            + gamma_beta[:, self.latent_dim :]
+        )
+
+        hist_latent = torch.cat((code_vel, fault_probability, code_latent), dim=-1)
+        actor_input = torch.cat([hist_latent, obs], dim=-1)
         out = self.actor_mlp(actor_input)
         return self.deterministic_output(out)
 
@@ -320,4 +340,3 @@ class _OnnxMLPModel(nn.Module):
     def output_names(self) -> list[str]:
         """Return ONNX output tensor names."""
         return ["actions"]
-

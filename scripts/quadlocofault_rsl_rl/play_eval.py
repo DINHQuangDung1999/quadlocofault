@@ -219,8 +219,8 @@ def _run_worker() -> int:
 
         fault_event = env_cfg.events.randomize_actuator_faults
         fault_event.params["severe_fault_prob"] = 1.0
-        fault_event.params["failure_coef_severe"] = fault_coef
-        fault_event.params["failure_coef_moderate"] = fault_coef
+        # fault_event.params["failure_coef_severe"] = fault_coef
+        # fault_event.params["failure_coef_moderate"] = fault_coef
 
     def _create_runner(env, agent_cfg: RslRlBaseRunnerCfg, resume_path: str):
         if agent_cfg.class_name == "OnPolicyRunner":

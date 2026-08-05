@@ -14,7 +14,7 @@ from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
-
+import math
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
@@ -34,6 +34,51 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--fault_tcn_checkpoint",
+    type=str,
+    default=None,
+    help=(
+        "Optional offline FaultResidualTCN checkpoint used to predict faults from observation "
+        "history. Fault prediction is disabled when omitted."
+    ),
+)
+parser.add_argument(
+    "--fault_threshold",
+    type=float,
+    default=0.5,
+    help="Sigmoid probability threshold used to declare a joint faulty.",
+)
+parser.add_argument(
+    "--fault_print_interval",
+    type=int,
+    default=15,
+    help="Print TCN fault predictions every N simulation steps (zero disables printing).",
+)
+parser.add_argument(
+    "--collect_fused_latent",
+    action="store_true",
+    default=False,
+    help="Collect the EquivGCN actor's fused latent and save a fault-colored t-SNE plot.",
+)
+parser.add_argument(
+    "--latent_collect_step",
+    type=int,
+    default=50,
+    help="Simulation step at which to collect fused latents from all environments.",
+)
+parser.add_argument(
+    "--latent_tsne_output",
+    type=str,
+    default="fused_latent_tsne.pdf",
+    help="Output path for the fused-latent t-SNE PDF.",
+)
+parser.add_argument(
+    "--latent_tsne_perplexity",
+    type=float,
+    default=30.0,
+    help="Perplexity used by t-SNE.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -68,6 +113,7 @@ import gymnasium as gym
 import torch
 from rsl_rl.runners import DistillationRunner
 from runners import CustomOnPolicyRunner
+from models.equiv_gcn_actor import FaultResidualTCN
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -97,6 +143,171 @@ import isaacsim.core.utils.stage as stage_utils
 from pxr import UsdPhysics, UsdGeom, Gf, Sdf
 if not args_cli.headless:
     import omni.ui as ui 
+
+
+def load_fault_tcn(checkpoint_path: str, device: torch.device | str) -> tuple[FaultResidualTCN, dict]:
+    """Create the offline fault classifier and restore its trained weights."""
+    checkpoint_path = os.path.abspath(os.path.expanduser(checkpoint_path))
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Fault TCN checkpoint does not exist: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if checkpoint.get("model_class") != "FaultResidualTCN":
+        raise ValueError(
+            f"Expected a FaultResidualTCN checkpoint, got {checkpoint.get('model_class')!r}."
+        )
+
+    model_kwargs = checkpoint.get("model_kwargs")
+    classifier_state_dict = checkpoint.get("classifier_state_dict")
+    if not isinstance(model_kwargs, dict) or not isinstance(classifier_state_dict, dict):
+        raise KeyError(
+            "Fault TCN checkpoint must contain model_kwargs and classifier_state_dict."
+        )
+
+    model = FaultResidualTCN(**model_kwargs).to(device)
+    incompatible = model.load_state_dict(classifier_state_dict, strict=False)
+    expected_missing = {"film_head.weight", "film_head.bias"}
+    if set(incompatible.missing_keys) != expected_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Fault TCN weights do not match the model: "
+            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+        )
+    model.eval()
+    print(
+        f"[INFO] Loaded fault TCN from {checkpoint_path} "
+        f"(epoch {checkpoint.get('epoch', 'unknown')})."
+    )
+    return model, checkpoint
+
+
+def print_fault_predictions(
+    probabilities: torch.Tensor,
+    joint_names: list[str],
+    threshold: float,
+) -> None:
+    """Print one readable prediction line per simulated environment."""
+    predicted_mask = probabilities >= threshold
+    probabilities_cpu = probabilities.detach().cpu()
+    predicted_mask_cpu = predicted_mask.detach().cpu()
+    for env_id, (env_probabilities, env_mask) in enumerate(
+        zip(probabilities_cpu, predicted_mask_cpu)
+    ):
+        predicted = [
+            f"{joint_names[joint_id]}={env_probabilities[joint_id]:.3f}"
+            for joint_id in env_mask.nonzero(as_tuple=False).flatten().tolist()
+        ]
+        if not predicted:
+            most_likely_id = int(env_probabilities.argmax())
+            prediction = (
+                f"healthy (highest: {joint_names[most_likely_id]}="
+                f"{env_probabilities[most_likely_id]:.3f})"
+            )
+        else:
+            prediction = ", ".join(predicted)
+        print(f"[FAULT TCN] env={env_id}: {prediction}")
+
+
+def compute_fused_latent(actor, history: torch.Tensor) -> torch.Tensor:
+    """Reproduce the EquivGCN actor's fused latent for a batch of histories."""
+    required_attributes = (
+        "obs_hist_normalizer",
+        "gcn_encoder",
+        "fault_residual_encoder",
+    )
+    missing = [name for name in required_attributes if not hasattr(actor, name)]
+    if missing:
+        raise TypeError(
+            "Fused-latent collection requires an EquivGCNActor; "
+            f"the loaded actor is missing {missing}."
+        )
+
+    normalized_history = actor.obs_hist_normalizer(history)
+    gcn_latent = actor.gcn_encoder(normalized_history).mean(dim=1)
+    fault_logits, gamma, beta = actor.fault_residual_encoder(normalized_history)
+    fault_probability = torch.sigmoid(fault_logits)
+    fault_gate = fault_probability.amax(dim=1, keepdim=True)
+    return (1.0 + fault_gate * gamma) * gcn_latent + fault_gate * beta
+
+
+def save_fused_latent_tsne(
+    fused_latent: torch.Tensor,
+    fault_mask: torch.Tensor,
+    joint_names: list[str],
+    output_path: str,
+    perplexity: float,
+    seed: int,
+) -> None:
+    """Project fused latents to two dimensions and save a fault-colored PDF."""
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from sklearn.manifold import TSNE
+    except ImportError as exc:
+        raise ImportError(
+            "Fused-latent plotting requires matplotlib and scikit-learn."
+        ) from exc
+
+    latent_numpy = fused_latent.detach().float().cpu().numpy()
+    fault_mask_cpu = fault_mask.detach().bool().cpu()
+    if latent_numpy.shape[0] < 2:
+        raise ValueError("t-SNE requires latent vectors from at least two environments.")
+    if not 0.0 < perplexity < latent_numpy.shape[0]:
+        raise ValueError(
+            f"t-SNE perplexity must be between 0 and the sample count "
+            f"({latent_numpy.shape[0]}), got {perplexity}."
+        )
+
+    healthy_class = len(joint_names)
+    fault_labels = torch.full(
+        (fault_mask_cpu.shape[0],),
+        healthy_class,
+        dtype=torch.long,
+    )
+    has_fault = fault_mask_cpu.any(dim=1)
+    fault_labels[has_fault] = fault_mask_cpu[has_fault].float().argmax(dim=1)
+    fault_labels_numpy = fault_labels.numpy()
+
+    embedding = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        init="pca",
+        learning_rate="auto",
+        random_state=seed,
+    ).fit_transform(latent_numpy)
+
+    output_path = os.path.abspath(os.path.expanduser(output_path))
+    output_directory = os.path.dirname(output_path)
+    if output_directory:
+        os.makedirs(output_directory, exist_ok=True)
+
+    figure, axis = plt.subplots(figsize=(10, 8))
+    colors = plt.get_cmap("tab20", healthy_class + 1)
+    present_classes = np.unique(fault_labels_numpy)
+    for class_id in present_classes:
+        class_points = fault_labels_numpy == class_id
+        class_name = "healthy" if class_id == healthy_class else joint_names[class_id]
+        axis.scatter(
+            embedding[class_points, 0],
+            embedding[class_points, 1],
+            s=10,
+            alpha=0.7,
+            color=colors(class_id),
+            label=f"{class_name} (n={class_points.sum()})",
+            rasterized=True,
+        )
+    axis.set_title(f"EquivGCN fused latent at step {args_cli.latent_collect_step}")
+    axis.set_xlabel("t-SNE 1")
+    axis.set_ylabel("t-SNE 2")
+    axis.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
+    figure.tight_layout()
+    figure.savefig(output_path, format="pdf", bbox_inches="tight")
+    plt.close(figure)
+    print(
+        f"[INFO] Saved {latent_numpy.shape[0]} fused latent vectors "
+        f"({latent_numpy.shape[1]} dimensions) to: {output_path}"
+    )
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -115,6 +326,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.collect_fused_latent:
+        if args_cli.latent_collect_step < 0:
+            raise ValueError("--latent_collect_step must be non-negative.")
+        if not hasattr(env_cfg.events, "randomize_actuator_faults"):
+            raise AttributeError(
+                "Fused-latent collection requires the randomize_actuator_faults event."
+            )
+        env_cfg.events.randomize_actuator_faults.interval_range_s = (0.0, 0.0)
+        print("[INFO] Fused-latent collection enabled; actuator faults start immediately.")
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -169,6 +389,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
+    actor = runner.alg.actor
+    fault_tcn = None
+    if args_cli.fault_tcn_checkpoint is not None:
+        if not 0.0 < args_cli.fault_threshold < 1.0:
+            raise ValueError("--fault_threshold must be between zero and one.")
+        if args_cli.fault_print_interval < 0:
+            raise ValueError("--fault_print_interval must be non-negative.")
+        fault_tcn, _ = load_fault_tcn(
+            args_cli.fault_tcn_checkpoint,
+            env.unwrapped.device,
+        )
 
     # export the trained policy to JIT and ONNX formats
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
@@ -209,7 +440,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         asset = env.unwrapped.scene["robot"]
         # breakpoint()
         # Vis debug joint fault
-        if (asset.faulty_joint_idx > 0).sum() > 0:
+        if (
+            not args_cli.collect_fused_latent
+            and (asset.faulty_joint_idx > 0).sum() > 0
+        ):
             
             stage = stage_utils.get_current_stage()
             dof_paths = asset.root_physx_view.dof_paths[0]  # joint prim paths
@@ -242,6 +476,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             #     print(asset.motors_strength[_env_idx])        
         
         with torch.inference_mode():
+            history = obs["history"]
+            if fault_tcn is not None:
+                if history.ndim != 3 or history.shape[-1] != 45:
+                    raise ValueError(
+                        "Fault TCN requires obs['history'] shaped [num_envs, history_length, 45], "
+                        f"got {tuple(history.shape)}."
+                    )
+                fault_logits, _, _ = fault_tcn(history)
+                if fault_logits.shape[-1] == 13:
+                    # Classes 0..11 are faulty joints and class 12 is healthy.
+                    fault_probabilities = torch.softmax(fault_logits, dim=-1)[:, :12]
+                else:
+                    fault_probabilities = torch.sigmoid(fault_logits)
+                if (
+                    not args_cli.collect_fused_latent
+                    and args_cli.fault_print_interval > 0
+                    and timestep % args_cli.fault_print_interval == 0
+                ):
+                    print_fault_predictions(
+                        fault_probabilities,
+                        list(asset.joint_names),
+                        args_cli.fault_threshold,
+                    )
+
             # agent stepping
             # breakpoint()
             # obs_policy, obs_hist = obs['policy'], obs['history']
@@ -251,6 +509,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 actions, _ = outputs 
             else:
                 actions = outputs
+
+            if args_cli.collect_fused_latent and timestep == args_cli.latent_collect_step:
+                fused_latent = compute_fused_latent(actor, history)
+                save_fused_latent_tsne(
+                    fused_latent=fused_latent,
+                    fault_mask=asset.faulty_joint_idx,
+                    joint_names=list(asset.joint_names),
+                    output_path=args_cli.latent_tsne_output,
+                    perplexity=args_cli.latent_tsne_perplexity,
+                    seed=env_cfg.seed,
+                )
+                break
+
             # env stepping
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated
@@ -258,8 +529,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 policy.reset(dones)
             else:
                 policy_nn.reset(dones)
+            # with torch.no_grad():
+            #     fault_logits, gamma, beta = policy.fault_residual_encoder(obs['history'])
+            #     targets = obs['critic'][:, -12:].float()
+            #     probs = torch.sigmoid(fault_logits - math.log(19))
+
+            #     faulty_sample_rate = (targets.sum(dim=-1) > 0).float().mean()
+            #     positive_bit_rate = targets.mean()
+            #     predicted_probability = probs.mean()
+            #     predicted_positive_rate = (probs > 0.5).float().mean()
+
+            #     true_positive = ((probs > 0.5) & (targets > 0.5)).sum()
+            #     recall = true_positive / (targets.sum() + 1e-8)
+
+            #     fault_mask = targets.sum(dim=-1) > 0
+            #     localization_accuracy = (
+            #         probs[fault_mask].argmax(dim=-1)
+            #         == targets[fault_mask].argmax(dim=-1)
+            #     ).float().mean()
+            #     print("Fault pred prob:", probs)
+            #     print("Fault pred pos rate:", predicted_positive_rate)
+
+        timestep += 1
         if args_cli.video:
-            timestep += 1
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break

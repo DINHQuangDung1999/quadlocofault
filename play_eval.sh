@@ -1,23 +1,26 @@
-# python scripts/quadlocofault_rsl_rl/play_eval.py \
-#     --num_envs 100 \
-#     --task GCN-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
-#     --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_gcn/2026-06-11_03-18-37/model_1999.pt \
-#     --headless
+# python scripts/quadlocofault_rsl_rl/eval.py \
+#   --task EquivGCN-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
+#   --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_equiv_gcn/2026-07-27_13-38-42/model_3999.pt \
+#   --num_envs 100 \
+#   --duration 10 \
+#   --num_episodes 2\
+#   --command_x 1.0 \
+#   --headless 
 
-# python scripts/quadlocofault_rsl_rl/play_eval.py \
-#     --num_envs 100 \
-#     --task FTNet-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
-#     --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_ftnet/2026-06-10_19-50-55/model_1999.pt \
-#     --headless
 
-# python scripts/quadlocofault_rsl_rl/play_eval.py \
-#     --num_envs 100 \
-#     --task FLEX-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
-#     --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_flex/2026-06-10_23-36-44/model_1999.pt \
-#     --headless
+# python scripts/quadlocofault_rsl_rl/eval.py \
+#   --task FLEX-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
+#   --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_flex/baseline/model_3999.pt \
+#   --num_envs 50 \
+#   --duration 8 \
+#   --num_episodes 2\
+#   --command_x 1.0 \
 
-python scripts/quadlocofault_rsl_rl/play_eval.py \
-    --num_envs 100 \
-    --task Base-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
-    --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_base/2026-06-10_14-22-50/model_1999.pt \
-    --headless
+python scripts/quadlocofault_rsl_rl/eval.py \
+  --task FTNet-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
+  --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_ftnet/baseline/model_3999.pt \
+  --num_envs 50 \
+  --duration 10 \
+  --num_episodes 2\
+  --command_x 0.7 \
+  --headless 

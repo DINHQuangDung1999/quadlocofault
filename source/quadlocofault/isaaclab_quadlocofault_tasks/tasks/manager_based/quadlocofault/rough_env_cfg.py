@@ -9,7 +9,8 @@ from ..velocity_env_cfg import LocomotionVelocityRoughEnvCfg, \
     LocomotionVelocityRoughFTNetEnvCfg, \
     LocomotionVelocityRoughPINNEnvCfg, \
     LocomotionVelocityRoughFLEXEnvCfg, \
-    LocomotionVelocityRoughGCNEnvCfg
+    LocomotionVelocityRoughGCNEnvCfg, \
+    LocomotionVelocityRoughOracleEnvCfg
 
 ##
 # Pre-defined configs
@@ -86,13 +87,12 @@ class UnitreeGo2RoughEnvCfg_PLAY(UnitreeGo2RoughEnvCfg):
 
 
 @configclass
-class UnitreeGo2RoughOracleEnvCfg(LocomotionVelocityRoughEnvCfg):
+class UnitreeGo2RoughOracleEnvCfg(LocomotionVelocityRoughOracleEnvCfg):
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
         # reduce action scale
         self.actions.joint_pos.scale = 0.25
-        self.observations.policy = self.observations.CriticCfg()
         # event
         # self.events.randomize_actuator_gains = None
         self.events.push_robot = None
@@ -123,13 +123,13 @@ class UnitreeGo2RoughOracleEnvCfg_PLAY(UnitreeGo2RoughOracleEnvCfg):
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
-        self.events.randomize_actuator_faults.params["severe_fault_prob"] = 1.0
+        self.events.randomize_actuator_faults.params["severe_fault_prob"] = 0.9
         self.events.randomize_actuator_faults.params["failure_coef_severe"] = 0.1
         self.events.randomize_actuator_faults.params["failure_coef_moderate"] = 0.6
         self.events.randomize_actuator_faults.params["num_faults"] = 1
-        self.events.randomize_actuator_faults.interval_range_s=(0.0, 0.0)
+        # self.events.randomize_actuator_faults.interval_range_s=(0.0, 0.0)
         # self.events.randomize_actuator_faults = None
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0,0.7)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.7,0.7)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0,0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0,0.0)
         # make a smaller scene for play
@@ -195,9 +195,9 @@ class UnitreeGo2RoughFTNetEnvCfg_PLAY(UnitreeGo2RoughFTNetEnvCfg):
         self.events.randomize_actuator_faults.params["failure_coef_severe"] = 0.1
         self.events.randomize_actuator_faults.params["failure_coef_moderate"] = 0.6
         self.events.randomize_actuator_faults.params["num_faults"] = 1
-        self.events.randomize_actuator_faults.interval_range_s=(0.0, 0.0)
+        self.events.randomize_actuator_faults.interval_range_s=(2.0, 2.0)
         # self.events.randomize_actuator_faults = None
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0,0.7)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.7,0.7)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0,0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0,0.0)
         # make a smaller scene for play
@@ -210,10 +210,11 @@ class UnitreeGo2RoughFTNetEnvCfg_PLAY(UnitreeGo2RoughFTNetEnvCfg):
             self.scene.terrain.terrain_generator.num_rows = 5
             self.scene.terrain.terrain_generator.num_cols = 5
             self.scene.terrain.terrain_generator.curriculum = False
-            self.scene.terrain.terrain_generator.difficulty_range = (0.5, 0.5)
+            # self.scene.terrain.terrain_generator.difficulty_range = (0.5, 0.5)
             # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.05, 0.15)
             # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.05, 0.15)
-
+            # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_width = 0.8
+            # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_width = 0.8
         # disable randomization for play
         self.observations.policy.enable_corruption = False
         # remove random pushing event
@@ -329,12 +330,12 @@ class UnitreeGo2RoughFLEXEnvCfg_PLAY(UnitreeGo2RoughFLEXEnvCfg):
         # post init of parent
         super().__post_init__()
         self.events.randomize_actuator_faults.params["severe_fault_prob"] = 1.0
-        self.events.randomize_actuator_faults.params["failure_coef_severe"] = 0.0
+        self.events.randomize_actuator_faults.params["failure_coef_severe"] = 0.1
         self.events.randomize_actuator_faults.params["failure_coef_moderate"] = 0.6
         self.events.randomize_actuator_faults.params["num_faults"] = 1
-        self.events.randomize_actuator_faults.interval_range_s=(3.0, 5.0)
+        # self.events.randomize_actuator_faults.interval_range_s=(0.0, 0.0)
         # self.events.randomize_actuator_faults = None
-        self.commands.base_velocity.ranges.lin_vel_x = (1.0,1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.7,0.7)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0,0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0,0.0)
         # make a smaller scene for play
@@ -348,8 +349,10 @@ class UnitreeGo2RoughFLEXEnvCfg_PLAY(UnitreeGo2RoughFLEXEnvCfg):
             self.scene.terrain.terrain_generator.num_cols = 5
             self.scene.terrain.terrain_generator.curriculum = False
             self.scene.terrain.terrain_generator.difficulty_range = (0.5, 0.5)
-            self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.05, 0.15)
-            self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.05, 0.15)
+            # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.05, 0.15)
+            # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.05, 0.15)
+            # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_width = 0.8
+            # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_width = 0.8
 
         # disable randomization for play
         self.observations.policy.enable_corruption = False
@@ -362,7 +365,7 @@ class UnitreeGo2RoughGCNEnvCfg(LocomotionVelocityRoughGCNEnvCfg):
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
-        self.observations.history.history_length = 5
+        self.observations.history.history_length = 30
 
         # reduce action scale
         self.actions.joint_pos.scale = 0.25
@@ -396,12 +399,12 @@ class UnitreeGo2RoughGCNEnvCfg_PLAY(UnitreeGo2RoughGCNEnvCfg):
         super().__post_init__()
         # post init of parent
         self.events.randomize_actuator_faults.params["severe_fault_prob"] = 1.0
-        self.events.randomize_actuator_faults.params["failure_coef_severe"] = 0.0
+        self.events.randomize_actuator_faults.params["failure_coef_severe"] = 0.1
         self.events.randomize_actuator_faults.params["failure_coef_moderate"] = 0.6
         self.events.randomize_actuator_faults.params["num_faults"] = 1
-        self.events.randomize_actuator_faults.interval_range_s=(3.0, 5.0)
+        self.events.randomize_actuator_faults.interval_range_s=(3.0, 3.0)
         # self.events.randomize_actuator_faults = None
-        self.commands.base_velocity.ranges.lin_vel_x = (1.0,1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.7,0.7)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0,0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0,0.0)
         # make a smaller scene for play
@@ -415,8 +418,8 @@ class UnitreeGo2RoughGCNEnvCfg_PLAY(UnitreeGo2RoughGCNEnvCfg):
             self.scene.terrain.terrain_generator.num_cols = 5
             self.scene.terrain.terrain_generator.curriculum = False
             self.scene.terrain.terrain_generator.difficulty_range = (0.5, 0.5)
-            self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.05, 0.15)
-            self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.05, 0.15)
+            # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.05, 0.15)
+            # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.05, 0.15)
 
         # disable randomization for play
         self.observations.policy.enable_corruption = False

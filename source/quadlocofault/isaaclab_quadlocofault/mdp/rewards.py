@@ -15,7 +15,7 @@ import torch
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import ContactSensor
+from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
 from isaaclab.assets import Articulation, RigidObject
 
@@ -28,20 +28,27 @@ def _get_faulty_leg_mask(asset: Articulation, body_names: list[str]) -> torch.Te
     if not hasattr(asset, "faulty_joint_idx"):
         return torch.zeros((asset.num_instances, len(body_names)), device=asset.device, dtype=torch.float)
 
-    joint_faults = asset.faulty_joint_idx.float()
-    leg_fault_by_prefix: dict[str, torch.Tensor] = {}
-    for prefix in ("FL", "FR", "RL", "RR"):
-        joint_ids = [i for i, joint_name in enumerate(asset.joint_names) if joint_name.startswith(prefix)]
-        if joint_ids:
-            leg_fault_by_prefix[prefix] = joint_faults[:, joint_ids].amax(dim=1)
-
-    body_faults = []
-    for body_name in body_names:
-        prefix = body_name[:2]
-        body_faults.append(
-            leg_fault_by_prefix.get(prefix, torch.zeros(asset.num_instances, device=asset.device, dtype=torch.float))
+    # Go2 joint order is:
+    #   [FL, FR, RL, RR] hips,
+    #   [FL, FR, RL, RR] thighs,
+    #   [FL, FR, RL, RR] calves.
+    # Reshape to [env, joint_type, leg], reduce over joint types, and select
+    # the corresponding leg for every requested body. Repeated prefixes allow
+    # the same mask to be used for feet, calves, thighs, or any combination.
+    leg_index_by_prefix = {"FL": 0, "FR": 1, "RL": 2, "RR": 3}
+    body_prefixes = [name[:2] for name in body_names]
+    invalid_prefixes = sorted(set(body_prefixes) - leg_index_by_prefix.keys())
+    if invalid_prefixes:
+        raise ValueError(
+            "Faulty-leg mask requires FL/FR/RL/RR body-name prefixes, "
+            f"but received invalid prefixes {invalid_prefixes} from {body_names}."
         )
-    return torch.stack(body_faults, dim=1)
+    faults_by_type_and_leg = asset.faulty_joint_idx.reshape(asset.num_instances, 3, 4)
+    faulty_legs = faults_by_type_and_leg.any(dim=1).float()
+    return torch.stack(
+        [faulty_legs[:, leg_index_by_prefix[prefix]] for prefix in body_prefixes],
+        dim=1,
+    )
 
 def power_distribution(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize joint torques applied on the articulation using L2 squared kernel.
@@ -80,34 +87,18 @@ def foot_clearance_reward(
 def foot_clearance_reward_dreamflex(
     env,
     asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
     target_height: float,
 ):
     asset: Articulation = env.scene[asset_cfg.name]
+    sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
 
-    foot_ids = asset_cfg.body_ids
-    foot_pos_w = asset.data.body_pos_w[:, foot_ids, :]
-    root_pos_w = asset.data.root_pos_w.unsqueeze(1)
-    foot_pos_rel_w = foot_pos_w - root_pos_w
-
-    num_envs = foot_pos_w.shape[0]
-    num_feet = foot_pos_w.shape[1]
-    root_quat_feet = asset.data.root_quat_w.unsqueeze(1).expand(-1, num_feet, -1)
-    foot_pos_b = quat_rotate_inverse(
-        root_quat_feet.reshape(-1, 4),
-        foot_pos_rel_w.reshape(-1, 3),
-    ).view(num_envs, num_feet, 3)
-    foot_vel_w = asset.data.body_lin_vel_w[:, foot_ids, :]
-    foot_vel_b = quat_rotate_inverse(
-        root_quat_feet.reshape(-1, 4),
-        foot_vel_w.reshape(-1, 3),
-    ).view(num_envs, num_feet, 3)
-
-    # leg-level fault mask from 12-joint mask -> 4-leg mask
-    faulty_joint_mask = asset.faulty_joint_idx.view(asset.faulty_joint_idx.shape[0], 4, 3).any(dim=-1)
-    normal_leg_mask = (~faulty_joint_mask).float()
-
-    foot_z_error = (foot_pos_b[:, :, 2] - target_height).square()
-    foot_xy_speed = torch.norm(foot_vel_b[:, :, :2], dim=-1)
+    foot_ids, foot_names = asset.find_bodies(".*_foot", preserve_order=True)
+    foot_height_w = asset.data.body_pos_w[:, foot_ids, 2]
+    terrain_height_w = torch.mean(sensor.data.ray_hits_w[..., 2], dim=1, keepdim=True)
+    foot_z_error = torch.square(foot_height_w - terrain_height_w - target_height)
+    foot_xy_speed = torch.norm(asset.data.body_lin_vel_w[:, foot_ids, :2], dim=-1)
+    normal_leg_mask = 1.0 - _get_faulty_leg_mask(asset, foot_names)
 
     return torch.sum(foot_z_error * foot_xy_speed * normal_leg_mask, dim=1)
 
@@ -123,13 +114,126 @@ def faulty_leg_contact_reward(
 
     foot_sensor_ids, foot_names = contact_sensor.find_bodies(".*_foot", preserve_order=True)
     faulty_leg_mask = _get_faulty_leg_mask(asset, foot_names)
-
     foot_contact_force = torch.norm(contact_sensor.data.net_forces_w[:, foot_sensor_ids, :], dim=-1)
     faulty_contacts = (foot_contact_force > threshold).float() * faulty_leg_mask
     return torch.sum(faulty_contacts, dim=1)
 
+
+def faulty_leg_link_contact_reward(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Penalize thigh and calf contacts belonging to a faulty leg."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    link_sensor_ids, link_names = contact_sensor.find_bodies(
+        ".*_(thigh|calf)", preserve_order=True
+    )
+    faulty_link_mask = _get_faulty_leg_mask(asset, link_names)
+    link_contact_force = torch.norm(
+        contact_sensor.data.net_forces_w[:, link_sensor_ids, :], dim=-1
+    )
+    faulty_contacts = (link_contact_force > threshold).float() * faulty_link_mask
+    return torch.sum(faulty_contacts, dim=1)
+
+
+def faulty_foot_lift_reward(
+    env: ManagerBasedRLEnv,
+    height_sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_clearance: float = 0.08,
+    severity_temperature: float = 0.15,
+) -> torch.Tensor:
+    """Penalize insufficient faulty-foot clearance above the terrain.
+
+    The mean terrain height follows Isaac Lab's ``base_height_l2`` convention.
+    The normalized squared cost is one at zero clearance and becomes zero once
+    the target clearance is reached; lifting higher incurs no additional cost.
+    The penalty is scaled continuously by fault severity using
+    ``exp(-motor_strength / severity_temperature)``. Thus, an almost powerless
+    motor receives a weight near one and moderate faults rapidly approach zero.
+
+    This function returns a non-negative cost and should therefore be configured
+    with a negative reward weight.
+    """
+    if target_clearance <= 0.0:
+        raise ValueError(f"target_clearance must be positive, got {target_clearance}.")
+    if severity_temperature <= 0.0:
+        raise ValueError(f"severity_temperature must be positive, got {severity_temperature}.")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    if not hasattr(asset, "motors_strength") or not hasattr(asset, "faulty_joint_idx"):
+        return torch.zeros(asset.num_instances, device=asset.device)
+
+    height_sensor: RayCaster = env.scene.sensors[height_sensor_cfg.name]
+    foot_ids, foot_names = asset.find_bodies(".*_foot", preserve_order=True)
+    foot_height_w = asset.data.body_link_pos_w[:, foot_ids, 2]
+    terrain_height_w = torch.mean(height_sensor.data.ray_hits_w[..., 2], dim=1, keepdim=True)
+    # Go2 joint order is [joint_type, leg] after reshaping:
+    # hip/thigh/calf x FL/FR/RL/RR.
+    if tuple(name[:2] for name in foot_names) != ("FL", "FR", "RL", "RR"):
+        raise ValueError(f"Expected feet in FL/FR/RL/RR order, received {foot_names}.")
+    fault_marked = asset.faulty_joint_idx.reshape(asset.num_instances, 3, 4).bool()
+    motor_strength = asset.motors_strength.reshape(asset.num_instances, 3, 4)
+    joint_severity = torch.exp(-motor_strength.clamp_min(0.0) / severity_temperature)
+    joint_severity *= fault_marked
+    leg_severity = joint_severity.amax(dim=1)
+
+    clearance = foot_height_w - terrain_height_w
+    normalized_shortfall = torch.clamp(
+        (target_clearance - clearance) / target_clearance,
+        min=0.0,
+        max=1.0,
+    )
+    lift_cost = torch.square(normalized_shortfall)
+    return torch.sum(lift_cost * leg_severity, dim=1)
+
+
+def fault_compensation_posture_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    thigh_lift_delta: float = -0.20,
+    knee_bend_delta: float = -0.20,
+    std: float = 0.15,
+) -> torch.Tensor:
+    """Reward a mild, joint-specific compensating posture on the faulty leg.
+
+    A calf (knee) fault targets the corresponding thigh/hip-pitch joint. A
+    thigh/hip-pitch fault targets flexion of the corresponding calf (knee)
+    joint. Lateral hip-joint faults are not shaped by this term. Targets are
+    offsets from the default pose.
+    """
+    if std <= 0.0:
+        raise ValueError(f"std must be positive, got {std}.")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    if not hasattr(asset, "faulty_joint_idx"):
+        return torch.zeros(asset.num_instances, device=asset.device)
+
+    # Go2 ordering: [hip joints (4), thigh joints (4), calf joints (4)].
+    joint_pos = asset.data.joint_pos.view(asset.num_instances, 3, 4)
+    default_pos = asset.data.default_joint_pos.view(asset.num_instances, 3, 4)
+    faults = asset.faulty_joint_idx.view(asset.num_instances, 3, 4).bool()
+
+    knee_fault = faults[:, 2]
+    thigh_fault = faults[:, 1]
+    thigh_reward = torch.exp(-torch.square(joint_pos[:, 1] - default_pos[:, 1] - thigh_lift_delta) / std**2)
+    knee_reward = torch.exp(-torch.square(joint_pos[:, 2] - default_pos[:, 2] - knee_bend_delta) / std**2)
+
+    fault_count = knee_fault.sum(dim=1) + thigh_fault.sum(dim=1)
+    reward = (thigh_reward * knee_fault + knee_reward * thigh_fault).sum(dim=1)
+    return reward / fault_count.clamp_min(1)
+
+
 def feet_air_time(
-    env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg, threshold: float
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float,
+    asset_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Reward long steps taken by the feet using L2-kernel.
 
@@ -144,7 +248,17 @@ def feet_air_time(
     # compute the reward
     first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
     last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
-    reward = torch.sum((last_air_time - threshold) * first_contact, dim=1)
+    air_time_reward = (last_air_time - threshold) * first_contact
+
+    # DreamFLEX defines this reward only for normal feet. Keep the generic
+    # Isaac Lab behavior (all feet) when no articulation is provided.
+    # if asset_cfg is not None:
+    asset: Articulation = env.scene[asset_cfg.name]
+    foot_ids, foot_names = asset.find_bodies(".*_foot", preserve_order=True)
+    faulty_leg_mask = _get_faulty_leg_mask(asset, foot_names)
+    air_time_reward *= 1.0 - faulty_leg_mask
+
+    reward = torch.sum(air_time_reward, dim=1)
     # no reward for zero command
     reward *= torch.norm(env.command_manager.get_command(command_name)[:, :2], dim=1) > 0.1
     return reward
@@ -172,7 +286,12 @@ def feet_air_time_positive_biped(env, command_name: str, threshold: float, senso
     return reward
 
 
-def feet_slide(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def feet_slide(
+    env,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ignore_faulty_legs: bool = False,
+) -> torch.Tensor:
     """Penalize feet sliding.
 
     This function penalizes the agent for sliding its feet on the ground. The reward is computed as the
@@ -185,7 +304,11 @@ def feet_slide(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = Scen
     asset = env.scene[asset_cfg.name]
 
     body_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2]
-    reward = torch.sum(body_vel.norm(dim=-1) * contacts, dim=1)
+    slide_cost = body_vel.norm(dim=-1) * contacts
+    if ignore_faulty_legs:
+        body_names = [asset.body_names[body_id] for body_id in asset_cfg.body_ids]
+        slide_cost *= 1.0 - _get_faulty_leg_mask(asset, body_names)
+    reward = torch.sum(slide_cost, dim=1)
     return reward
 
 
@@ -234,6 +357,14 @@ def vhip_style_reward_ftnet(
     theta_ddot_scale: float = 1.0,
     support_dist_scale: float = 1.0,
 ):
+    """Compute the three FT-Net VHIP heuristic terms.
+
+    The support-polygon term is evaluated on the convex hull of the feet that
+    are currently in contact. This avoids connecting FL/FR/RL/RR in a
+    self-crossing order and correctly closes the triangle when one foot is in
+    swing. Environments with no valid contact receive zero VHIP angle and
+    acceleration instead of measuring against the world origin.
+    """
     asset = env.scene[asset_cfg.name]
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
 
@@ -246,7 +377,12 @@ def vhip_style_reward_ftnet(
     foot_asset_ids = torch.tensor(foot_asset_ids, device=asset.device)
     foot_sensor_ids = torch.tensor(foot_sensor_ids, device=asset.device)
 
-    com_w = asset.data.root_com_pos_w
+    # ``root_com_pos_w`` is only the root link COM. FT-Net's p_COM denotes the
+    # whole robot, so use the mass-weighted COM of every articulation body.
+    body_masses = asset.root_physx_view.get_masses().to(asset.device)
+    com_w = torch.sum(asset.data.body_com_pos_w * body_masses.unsqueeze(-1), dim=1)
+    com_w /= body_masses.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
     foot_pos_w = asset.data.body_link_pos_w[:, foot_asset_ids, :]
     forces_w = contact_sensor.data.net_forces_w[:, foot_sensor_ids, :]
 
@@ -254,30 +390,52 @@ def vhip_style_reward_ftnet(
     contact_mask = fz > contact_threshold
 
     masked_fz = fz * contact_mask
-    cop_w = (foot_pos_w * masked_fz.unsqueeze(-1)).sum(dim=1) / (masked_fz.sum(dim=1, keepdim=True) + 1e-6)
+    total_fz = masked_fz.sum(dim=1, keepdim=True)
+    has_contact = total_fz.squeeze(1) > 1e-6
+    cop_w = (foot_pos_w * masked_fz.unsqueeze(-1)).sum(dim=1) / total_fz.clamp_min(1e-6)
 
     l = com_w - cop_w
     l_norm = torch.norm(l, dim=-1).clamp_min(1e-6)
-    theta = torch.abs(torch.acos(torch.clamp(torch.abs(l[:, 2]) / l_norm, 0.0, 1.0)))
-    
+    theta = torch.acos(torch.clamp(torch.abs(l[:, 2]) / l_norm, 0.0, 1.0))
+    theta = torch.where(has_contact, theta, torch.zeros_like(theta))
+
     g = 9.81
-    theta_ddot = torch.abs(-(g / l_norm) * torch.sin(theta))
+    theta_ddot = (g / l_norm) * torch.sin(theta)
+    theta_ddot = torch.where(has_contact, theta_ddot, torch.zeros_like(theta_ddot))
 
     com_xy = com_w[:, :2]
     foot_xy = foot_pos_w[:, :, :2]
 
-    # Approximate support-polygon edge distance using contacting feet in fixed order.
-    # Better: compute convex hull on the contacting feet per env.
-    Ci = foot_xy
-    Cj = torch.roll(foot_xy, shifts=-1, dims=1)
-    oi = com_xy.unsqueeze(1) - Ci
-    oj = com_xy.unsqueeze(1) - Cj
-    cross = oi[..., 0] * oj[..., 1] - oi[..., 1] * oj[..., 0]
-    edge_len = torch.norm(Cj - Ci, dim=-1).clamp_min(1e-6)
-    dist = torch.abs(cross) /  edge_len
+    if foot_xy.shape[1] != 4:
+        raise ValueError(f"FT-Net VHIP reward expects four feet, got {foot_xy.shape[1]}.")
 
-    edge_mask = contact_mask & torch.roll(contact_mask, shifts=-1, dims=1)
-    dist = torch.where(edge_mask, dist, torch.zeros_like(dist))
+    # Test all six foot pairs. A pair belongs to the convex hull when all other
+    # contacting feet lie on one side of its supporting line. This handles all
+    # two-, three-, and four-foot contact combinations without Python loops.
+    pair_i = torch.tensor((0, 0, 0, 1, 1, 2), device=asset.device)
+    pair_j = torch.tensor((1, 2, 3, 2, 3, 3), device=asset.device)
+    ci = foot_xy[:, pair_i]
+    cj = foot_xy[:, pair_j]
+    edge = cj - ci
+    edge_len = torch.linalg.vector_norm(edge, dim=-1)
+
+    point_rel = foot_xy.unsqueeze(1) - ci.unsqueeze(2)
+    point_side = (
+        edge[..., 0].unsqueeze(2) * point_rel[..., 1]
+        - edge[..., 1].unsqueeze(2) * point_rel[..., 0]
+    )
+    active_points = contact_mask.unsqueeze(1)
+    has_positive_side = ((point_side > 1e-6) & active_points).any(dim=2)
+    has_negative_side = ((point_side < -1e-6) & active_points).any(dim=2)
+    pair_in_contact = contact_mask[:, pair_i] & contact_mask[:, pair_j]
+    hull_edge = pair_in_contact & ~(has_positive_side & has_negative_side) & (edge_len > 1e-6)
+
+    com_rel = com_xy.unsqueeze(1) - ci
+    com_cross = edge[..., 0] * com_rel[..., 1] - edge[..., 1] * com_rel[..., 0]
+    # FT-Net Eq. (6): triangle area divided by edge length. Triangle area
+    # contributes the factor 1/2.
+    dist = 0.5 * torch.abs(com_cross) / edge_len.clamp_min(1e-6)
+    dist = torch.where(hull_edge, dist, torch.zeros_like(dist))
     d_max = dist.max(dim=1).values
 
     return theta_scale * theta + theta_ddot_scale * theta_ddot + support_dist_scale * d_max
@@ -306,12 +464,24 @@ def VHIP_style_reward(
 def faulty_joint_motion_reward_dreamflex(
     env,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    action_name: str = "joint_pos",
 ):
     asset: Articulation = env.scene[asset_cfg.name]
 
     faulty_mask = asset.faulty_joint_idx.float()
     q = asset.data.joint_pos
-    q_des = asset.data.default_joint_pos
+
+    # DreamFLEX uses q_des = q_default + action. For a JointPositionAction,
+    # processed_actions is the exact scaled/offset position target sent to the
+    # articulation's PD controller.
+    action_term = env.action_manager.get_term(action_name)
+    q_des = action_term.processed_actions
+
+    if q_des.shape[1] != q.shape[1]:
+        raise ValueError(
+            f"DreamFLEX faulty-joint reward expected {q.shape[1]} desired joint positions "
+            f"from action term '{action_name}', but received {q_des.shape[1]}."
+        )
 
     return torch.sum(((q - q_des) ** 2) * faulty_mask, dim=1)
 
@@ -381,8 +551,8 @@ def raibert_foot_placement_reward(
         + 0.5 * stance_time * v_cmd_xy.unsqueeze(1)
         + vel_gain * (v_body_xy - v_cmd_xy).unsqueeze(1)
     )
-    body_names = [asset.body_names[body_id] for body_id in asset_cfg.body_ids]
-    faulty_leg_mask = _get_faulty_leg_mask(asset, body_names)
+    foot_ids, foot_names = asset.find_bodies(".*_foot", preserve_order=True)
+    faulty_leg_mask = _get_faulty_leg_mask(asset, foot_names)
     normal_leg_mask = (1.0 - faulty_leg_mask).unsqueeze(-1)
 
     placement_error = torch.square(foot_xy - p_des_xy) * normal_leg_mask

@@ -180,6 +180,8 @@ class UnitreeGo2RoughPPOEquivGCNRunnerCfg(UnitreeGo2RoughPPOGCNRunnerCfg):
         super().__post_init__()
         self.actor.class_name = "EquivGCNActor"
         self.algorithm.class_name = "PPOEquivGCN"
+        # One faulty joint is supervised against the other eleven joint outputs.
+        # self.algorithm.fault_pos_weight = 11.0
         self.experiment_name = "unitree_go2_rough_equiv_gcn"
 
 

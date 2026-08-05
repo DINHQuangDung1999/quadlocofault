@@ -9,8 +9,7 @@ from dataclasses import MISSING
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG  # isort: skip
-from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.envs.mdp.actions.actions_cfg import JointPositionActionCfg
+from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -148,22 +147,18 @@ class CommandsCfg:
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_pos = JointPositionActionCfg(
+    joint_pos = mdp.FaultClampJointPositionActionCfg(
         asset_name="robot",
         joint_names=[".*"],
         scale=0.25,
-        use_default_offset=True, 
-        clip={".*": (-100.0, 100.0)}
+        use_default_offset=True,
+        clip={".*": (-100.0, 100.0)},
+        constraint_limits={
+            ".*_hip_joint": (-0.5, 0.5),
+            ".*_thigh_joint": (0.3, 1.3),
+            ".*_calf_joint": (-2.1, -0.8),
+        },
     )
-    # faultclamp_joint_pos = mdp.FaultClampJointPositionActionCfg(
-    #     asset_name="robot",
-    #     joint_names=[".*"],
-    #     scale=0.5,
-    #     use_default_offset=True,
-    #     constraint_joint_names=".*_calf_joint",
-    #     constraint_strength_threshold=0.3,
-    #     constraint_lower_limit=-2.1,
-    # )
 
 @configclass
 class ObservationsCfg:
@@ -360,16 +355,16 @@ class EventCfg:
             "asset_cfg" :SceneEntityCfg("robot", joint_names=".*"),
             "severe_fault_prob": 0.5,
             "failure_coef_severe": 0.3,
-            "failure_coef_moderate": 1.0,
+            "failure_coef_moderate": 0.8,
             "num_faults": 1,
             },
         mode="interval",
-        interval_range_s=(5.0, 15.0),
+        interval_range_s=(3.0, 8.0),
     )
+
 @configclass
 class RewardsCfg:
     """Reward terms for the MDP."""
-
     # -- task
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_exp, 
@@ -394,7 +389,7 @@ class RewardsCfg:
         func=mdp.base_height_l2, 
         weight=-1.0,
         params={
-            "target_height": 0.4,
+            "target_height": 0.35,
             "asset_cfg": SceneEntityCfg("robot"),
             "sensor_cfg": SceneEntityCfg("height_scanner"),
         })
@@ -403,6 +398,7 @@ class RewardsCfg:
         weight=1.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+            "asset_cfg": SceneEntityCfg("robot"),
             "command_name": "base_velocity",
             "threshold": 0.5,
         },
@@ -424,44 +420,83 @@ class FTNetRewardsCfg(RewardsCfg):
             "theta_ddot_scale": -0.01,
             "support_dist_scale": -0.01,
         })
-    # joint_motion_cosmetic = RewTerm(
-    #     func=mdp.joint_motion_cosmetic,
-    #     weight=1.0,
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot"),
-    #     }
-    # )
-    
-    # dof_vel = RewTerm(func=mdp.joint_vel_l2, weight=-0.001)
-    dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-2.0e-5)
-    # dof_power_l2 = RewTerm(func=mdp.joint_power, weight=-2.0e-5)
-    # dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-10.0)
+    joint_motion_cosmetic = RewTerm(
+        func=mdp.joint_motion_cosmetic,
+        weight=1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+        }
+    )
+
+@configclass
+class GCNRewardsCfg(RewardsCfg):
+    """FT-Net/VHIP rewards augmented with faulty-foot lifting."""
+    VHIP_style = RewTerm(
+        func=mdp.vhip_style_reward_ftnet, 
+        weight=1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces"),
+            "asset_cfg": SceneEntityCfg("robot"),
+            "contact_threshold": 1.0,
+            "theta_scale": -0.015,
+            "theta_ddot_scale": -0.01,
+            "support_dist_scale": -0.01,
+        })
+    # dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-2.0e-5)
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-0.1,
+        weight=-0.025,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
+            "ignore_faulty_legs": True,
         },
     )
-    # fault_leg_motion = RewTerm(
-    #     func=mdp.faulty_joint_motion_reward_dreamflex,
-    #     weight=-0.2,
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
-    #     },
-    # )
     faulty_leg_contact = RewTerm(
         func=mdp.faulty_leg_contact_reward,
-        weight=-0.1,
+        weight=-0.025,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot"),
             "asset_cfg": SceneEntityCfg("robot"),
             "threshold": 1.0,
         },
     )
+    faulty_leg_link_contact = RewTerm(
+        func=mdp.faulty_leg_link_contact_reward,
+        weight=-0.1,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", body_names=".*_(thigh|calf)"
+            ),
+            "asset_cfg": SceneEntityCfg("robot"),
+            "threshold": 1.0,
+        },
+    )
+
+    faulty_foot_lift = RewTerm(
+        func=mdp.faulty_foot_lift_reward,
+        weight=-0.05,
+        params={
+            "height_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "asset_cfg": SceneEntityCfg("robot"),
+            "target_clearance": 0.15,
+            "severity_temperature": 0.1,
+        },
+    )
+    # fault_compensation_posture = RewTerm(
+    #     func=mdp.fault_compensation_posture_reward,
+    #     weight=0.15,
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot"),
+    #         "thigh_lift_delta": -0.20,
+    #         "knee_bend_delta": -0.20,
+    #         "std": 0.15,
+    #     },
+    # )
+
 @configclass
 class DreamFLEXRewardsCfg(RewardsCfg):
+    # DreamFLEX applies the air-time reward only to non-faulty legs.
     power_distribution = RewTerm(
         func=mdp.power_distribution,
         weight=-1e-5
@@ -476,6 +511,7 @@ class DreamFLEXRewardsCfg(RewardsCfg):
         weight=-0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
             "target_height": 0.12,
         },
     )
@@ -501,6 +537,7 @@ class DreamFLEXRewardsCfg(RewardsCfg):
         weight=-0.2,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "action_name": "joint_pos",
         },
     )
     faulty_leg_contact = RewTerm(
@@ -512,6 +549,17 @@ class DreamFLEXRewardsCfg(RewardsCfg):
             "threshold": 1.0,
         },
     )
+    # faulty_leg_link_contact = RewTerm(
+    #     func=mdp.faulty_leg_link_contact_reward,
+    #     weight=-0.2,
+    #     params={
+    #         "sensor_cfg": SceneEntityCfg(
+    #             "contact_forces", body_names=".*_(thigh|calf)"
+    #         ),
+    #         "asset_cfg": SceneEntityCfg("robot"),
+    #         "threshold": 1.0,
+    #     },
+    # )
 
 @configclass
 class TerminationsCfg:
@@ -526,10 +574,10 @@ class TerminationsCfg:
     #     func=mdp.illegal_contact,
     #     params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=["Head.*"]), "threshold": 1.0},
     # )
-    # bad_orientation = DoneTerm(
-    #     func=mdp.bad_orientation,
-    #     params={"limit_angle": 1.0},
-    # )
+    bad_orientation = DoneTerm(
+        func=mdp.bad_orientation,
+        params={"limit_angle": math.pi/2},
+    )
 @configclass
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
@@ -556,14 +604,17 @@ class CurriculumCfg:
     actuator_faults = CurrTerm(
         func=mdp.actuator_fault_episode_reward_event,
         params={
-            "start_severe_fault_prob": 0.5,
-            "end_severe_fault_prob": 1.0,
+            "start_severe_fault_prob": 0.2,
+            "end_severe_fault_prob": 0.6,
             "start_failure_range": (0.3, 1.0),
-            "end_failure_range": (0.1, 0.6),
+            "end_failure_range": (0.1, 0.8),
             "move_up_reward_threshold": 24.0,
-            "reward_term_names": ("track_lin_vel_xy_exp", "track_ang_vel_z_exp"),
+            "reward_term_names": (
+                "track_lin_vel_xy_exp",
+                "track_ang_vel_z_exp",
+            ),
             "num_levels": 10,
-            "successes_per_level": 1,
+            "successes_per_level": 3,
             "event_name": "randomize_actuator_faults",
         },
     )
@@ -598,17 +649,17 @@ class LocomotionVelocityRoughEnvCfg(ManagerBasedRLEnvCfg):
     actions: ActionsCfg = ActionsCfg()
     commands: CommandsCfg = CommandsCfg()
     # MDP settings
-    rewards: RewardsCfg = FTNetRewardsCfg()
+    rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
-    
-    # num_prop: int = 49
-    # num_action: int = 12
-    # num_scan: int = 187
-    # num_priv_phys: int = 29
-    # num_hist: int = 30
-
+    # ### Behind and above
+    # viewer = ViewerCfg(
+    #     eye=(4.0, 0.0, 1.6),
+    #     lookat=(0.0, 0.0, 0.3),
+    #     asset_name="robot",
+    #     origin_type="asset_root",
+    # )
     def __post_init__(self):
         """Post initialization."""
         # general settings
@@ -677,8 +728,6 @@ class LocomotionVelocityRoughFTNetEnvCfg(LocomotionVelocityRoughEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # self.rewards.feet_air_time.weight = 1.5
-        # return 
 
 @configclass
 class LocomotionVelocityRoughPINNEnvCfg(LocomotionVelocityRoughEnvCfg):
@@ -686,20 +735,26 @@ class LocomotionVelocityRoughPINNEnvCfg(LocomotionVelocityRoughEnvCfg):
 
 @configclass
 class LocomotionVelocityRoughFLEXEnvCfg(LocomotionVelocityRoughEnvCfg):
-    rewards = FTNetRewardsCfg()
-    # rewards = DreamFLEXRewardsCfg ()
+    rewards = DreamFLEXRewardsCfg ()
 
     def __post_init__(self):
         super().__post_init__()
-        # self.rewards.feet_air_time.weight = 1.5
-        # return 
 
 @configclass
 class LocomotionVelocityRoughGCNEnvCfg(LocomotionVelocityRoughEnvCfg):
 
-    rewards = FTNetRewardsCfg()
+    rewards = GCNRewardsCfg()
 
     def __post_init__(self):
         super().__post_init__()
-        # self.rewards.feet_air_time.weight = 1.5
-        # return 
+
+@configclass
+class LocomotionVelocityRoughOracleEnvCfg(LocomotionVelocityRoughEnvCfg):
+
+    rewards = GCNRewardsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy = self.observations.CriticCfg()
+        self.observations.critic = None
+        self.observations.history = None

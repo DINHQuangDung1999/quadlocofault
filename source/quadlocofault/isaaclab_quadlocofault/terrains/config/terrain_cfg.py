@@ -27,7 +27,22 @@ ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
         #                                      num_waves=4, 
         #                                      amplitude_range=(0.0,0.25)
         # ),
-        "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.15),
+        "flat": terrain_gen.MeshPlaneTerrainCfg(
+            proportion=0.15
+        ),        
+        "grid": terrain_gen.MeshRandomGridTerrainCfg(
+            proportion=0.15,
+            grid_width=0.45,
+            grid_height_range=(0.02, 0.10),
+            platform_width=3.0,
+        ),
+        "random_rough": CustomHfRandomUniformTerrainCfg(
+            proportion=0.2,
+            noise_range=(-0.05, 0.05),
+            noise_step=0.01,
+            downsampled_scale=0.15,
+            border_width=0.25,
+        ),        
         "hf_pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
             proportion=0.15,
             slope_range=(0.0, 0.4),
@@ -39,13 +54,6 @@ ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
             slope_range=(0.0, 0.4), 
             platform_width=3.0, 
             border_width=0.25
-        ),
-        "random_rough": CustomHfRandomUniformTerrainCfg(
-            proportion=0.2,
-            noise_range=(-0.05, 0.05),
-            noise_step=0.01,
-            downsampled_scale=0.15,
-            border_width=0.25,
         ),
         "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
             proportion=0.1,
@@ -62,12 +70,6 @@ ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
             platform_width=3.0,
             border_width=1.0,
             holes=False,
-        ),
-        "grid": terrain_gen.MeshRandomGridTerrainCfg(
-            proportion=0.15,
-            grid_width=0.45,
-            grid_height_range=(0.02, 0.10),
-            platform_width=3.0,
         ),
         # "discrete_obstacles": terrain_gen.HfDiscreteObstaclesTerrainCfg(
         #     proportion=0.1,

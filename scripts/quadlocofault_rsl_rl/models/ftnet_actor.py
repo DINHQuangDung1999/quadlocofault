@@ -129,8 +129,10 @@ class FTNetActor(nn.Module):
 
         priv_latent = self.get_priv_latent(obs, masks, hidden_state)
         hist_latent = self.get_hist_latent(obs, masks, hidden_state)
-        actor_input = torch.cat([hist_latent, obs_policy], dim = -1)
-
+        if self.training:
+            actor_input = torch.cat([priv_latent, obs_policy], dim = -1)
+        else:
+            actor_input = torch.cat([hist_latent, obs_policy], dim = -1)
         # MLP forward pass
         # breakpoint()
         mlp_output = self.actor_mlp(actor_input)
@@ -222,15 +224,13 @@ class FTNetActor(nn.Module):
 
 
 class _TorchFTNetActor(nn.Module):
-    """Exportable CNN model for JIT."""
+    """TorchScript wrapper for the history-based FTNet inference path."""
 
     def __init__(self, model: FTNetActor) -> None:
-        """Create a TorchScript-friendly copy of a CNNModel."""
+        """Copy only the modules required for deployable inference."""
         super().__init__()
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
-        self.critic_obs_normalizer = copy.deepcopy(model.critic_obs_normalizer)
         self.obs_hist_normalizer = copy.deepcopy(model.obs_hist_normalizer)
-        # Convert ModuleDict to ModuleList for ordered iteration
         self.actor_mlp = copy.deepcopy(model.actor_mlp)
         self.hist_encoder_cnn = copy.deepcopy(model.hist_encoder_cnn)
         if model.distribution is not None:
@@ -242,7 +242,7 @@ class _TorchFTNetActor(nn.Module):
         obs = self.obs_normalizer(obs)
         obs_hist = self.obs_hist_normalizer(obs_hist)
         hist_latent = self.hist_encoder_cnn(obs_hist)
-        actor_input = torch.cat([hist_latent, obs], dim = -1)
+        actor_input = torch.cat([hist_latent, obs], dim=-1)
         out = self.actor_mlp(actor_input)
         return self.deterministic_output(out)
 

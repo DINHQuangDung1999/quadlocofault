@@ -3,10 +3,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tensordict import TensorDict
 
-from modules import GCNLayer
-
-from .gcn_actor import GCNActor
+from modules import GCNLayer, TemporalConvBlock
+from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
+from rsl_rl.modules.distribution import Distribution
+from rsl_rl.utils import resolve_callable
 
 
 class EquivGCNTemporalEncoder(nn.Module):
@@ -24,15 +26,12 @@ class EquivGCNTemporalEncoder(nn.Module):
     canonical coordinates before shared temporal encoding. This follows the
     sign-aware encoder / equivariant GNN separation used by MS-PPO.
     """
-
-    _C2_NODE_PERMUTATION = [7, 8, 9, 10, 11, 12, 13, 0, 1, 2, 3, 4, 5, 6]
     # Reorder Isaac joint features from
     # [FL/FR/RL/RR hip, FL/FR/RL/RR thigh, FL/FR/RL/RR calf]
-    # to [FL hip/thigh/calf, FR hip/thigh/calf, RL hip/thigh/calf,
+    # directly into graph order:
+    # [FL hip/thigh/calf, RL hip/thigh/calf, FR hip/thigh/calf,
     # RR hip/thigh/calf].
-    _JOINT_PERMUTATION = [0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11]
-    # Select joint nodes from the graph in the original Isaac joint order.
-    _JOINT_NODE_IDS = [1, 8, 4, 11, 2, 9, 5, 12, 3, 10, 6, 13]
+    _JOINT_PERMUTATION = [0, 4, 8, 2, 6, 10, 1, 5, 9, 3, 7, 11]
 
     def __init__(
         self,
@@ -52,8 +51,6 @@ class EquivGCNTemporalEncoder(nn.Module):
         self.num_joints = 12
 
         self.register_buffer("joint_permutation", torch.tensor(self._JOINT_PERMUTATION, dtype=torch.long))
-        self.register_buffer("joint_node_ids", torch.tensor(self._JOINT_NODE_IDS, dtype=torch.long))
-
         # Sagittal reflection signs for [angular velocity, gravity, command].
         self.register_buffer(
             "base_reflection_sign",
@@ -120,19 +117,22 @@ class EquivGCNTemporalEncoder(nn.Module):
             dim=-1,
         )
 
-        # Canonicalize right hips (FR and RR); thigh/calf coordinates already
-        # share the left-side convention for the Go2 joint definitions.
+        # Canonicalize right hips (FR and RR, at graph-joint indices 6 and 9);
+        # thigh/calf coordinates already share the left-side convention for
+        # the Go2 joint definitions.
         joints = joints.clone()
-        joints[:, :, (3, 9), :] *= -1.0
+        joints[:, :, (6, 9), :] *= -1.0
         bases = torch.stack((base, base * self.base_reflection_sign), dim=2)
         joints, bases = self._encode_temporal(joints, bases)
 
         graph = torch.stack(
             (
-                bases[:, 0], joints[:, 0], joints[:, 1], joints[:, 2],
-                joints[:, 6], joints[:, 7], joints[:, 8], bases[:, 1],
-                joints[:, 3], joints[:, 4], joints[:, 5], joints[:, 9],
-                joints[:, 10], joints[:, 11],
+                bases[:, 0], 
+                joints[:, 0], joints[:, 1], joints[:, 2],
+                joints[:, 3], joints[:, 4], joints[:, 5], 
+                bases[:, 1],
+                joints[:, 6], joints[:, 7], joints[:, 8], 
+                joints[:, 9], joints[:, 10], joints[:, 11],
             ),
             dim=1,
         )
@@ -140,29 +140,189 @@ class EquivGCNTemporalEncoder(nn.Module):
         return F.elu(self.gcn2(hidden, self.adj_norm))
 
 
-class EquivGCNActor(GCNActor):
-    """GCN actor variant using the duplicated-base 14-node Equ-GNN encoder."""
+class FaultResidualTCN(nn.Module):
+    """Encode global history into joint-fault logits and FiLM parameters."""
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    _LEFT_JOINT_IDS = [0, 2, 4, 6, 8, 10]
+    _RIGHT_JOINT_IDS = [1, 3, 5, 7, 9, 11]
+    _RIGHT_HIP_IDS = [1, 3]
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        film_dim: int,
+        film_scale: float = 0.5,
+        num_fault_classes: int = 12,
+    ) -> None:
+        super().__init__()
+        if num_fault_classes not in (12, 13):
+            raise ValueError(
+                f"num_fault_classes must be 12 or 13, got {num_fault_classes}."
+            )
+        self.film_scale = film_scale
+        self.num_fault_classes = num_fault_classes
+        self.register_buffer("left_joint_ids", torch.tensor(self._LEFT_JOINT_IDS, dtype=torch.long))
+        self.register_buffer("right_joint_ids", torch.tensor(self._RIGHT_JOINT_IDS, dtype=torch.long))
+        self.register_buffer("right_hip_ids", torch.tensor(self._RIGHT_HIP_IDS, dtype=torch.long))
+
+        self.tcn = nn.Sequential(
+            TemporalConvBlock(45, 2*hidden_dim, kernel_size=3, dilation=1),
+            TemporalConvBlock(2*hidden_dim, 2*hidden_dim, kernel_size=3, dilation=2),
+            TemporalConvBlock(2*hidden_dim, 2*hidden_dim, kernel_size=3, dilation=4),
+            TemporalConvBlock(2*hidden_dim, hidden_dim, kernel_size=3, dilation=8),
+        )
+        self.fault_head = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ELU(),
+            nn.Linear(64, 64),
+            nn.ELU(),
+            nn.Linear(64, num_fault_classes),
+        )
+        self.film_head = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ELU(),
+            nn.Linear(64, 64),
+            nn.ELU(),
+            nn.Linear(64, 2 * film_dim),
+        )
+        final_film_layer = self.film_head[-1]
+        nn.init.zeros_(final_film_layer.weight)
+        nn.init.zeros_(final_film_layer.bias)
+
+    def _symmetry_features(self, history: torch.Tensor) -> torch.Tensor:
+        """Return pair means/differences and base features with shape [B, H, 45]."""
+        position = history[:, :, :12].clone()
+        velocity = history[:, :, 12:24].clone()
+        previous_action = history[:, :, 24:36].clone()
+        base = history[:, :, 36:45]
+
+        # Express right hip signals in the corresponding left-hip coordinates.
+        position[:, :, self.right_hip_ids] *= -1.0
+        velocity[:, :, self.right_hip_ids] *= -1.0
+        previous_action[:, :, self.right_hip_ids] *= -1.0
+
+        means = []
+        differences = []
+        for feature in (position, velocity, previous_action):
+            left = feature.index_select(2, self.left_joint_ids)
+            right = feature.index_select(2, self.right_joint_ids)
+            means.append(0.5 * (left + right))
+            differences.append(0.5 * (left - right))
+
+        return torch.cat((*means, *differences, base), dim=-1)
+
+    def forward(self, history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if history.ndim != 3 or history.shape[-1] != 45:
+            raise ValueError(f"Expected history shape (batch, history, 45), got {tuple(history.shape)}.")
+
+        tcn_input = self._symmetry_features(history).permute(0, 2, 1)
+        fault_features = self.tcn(tcn_input)[:, :, -1]
+        fault_logits = self.fault_head(fault_features)
+        raw_gamma, raw_beta = self.film_head(fault_features.detach()).chunk(2, dim=-1)
+        gamma = self.film_scale * torch.tanh(raw_gamma)
+        beta = self.film_scale * torch.tanh(raw_beta)
+        return fault_logits, gamma, beta
+
+
+class EquivGCNActor(nn.Module):
+    """Actor with a symmetry-biased temporal GCN history encoder."""
+
+    is_recurrent: bool = False
+
+    def __init__(
+        self,
+        obs: TensorDict,
+        output_dim: int = 12,
+        activation: str = "elu",
+        obs_normalization: bool = False,
+        distribution_cfg: dict | None = None,
+        actor_hidden_dims: tuple[int, ...] | list[int] = (512, 256, 128),
+        gcn_hidden_dim: int = 16,
+        gcn_out_dim: int = 16,
+        tcn_hidden_dim: int = 16,
+        setup: int = 1,
+        **_: object,
+    ) -> None:
+        super().__init__()
+        if setup != 1:
+            raise ValueError("EquivGCNActor currently supports only setup=1.")
+
+        self.obs_hist_length, self.obs_dim = obs["history"].shape[1:]
+        self.action_dim = output_dim
+        self.gcn_hidden_dim = gcn_hidden_dim
+        self.gcn_out_dim = gcn_out_dim
+        self.setup = setup
+
+        if obs_normalization:
+            self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
+            self.obs_hist_normalizer = EmpiricalNormalization((self.obs_hist_length, self.obs_dim))
+        else:
+            self.obs_normalizer = nn.Identity()
+            self.obs_hist_normalizer = nn.Identity()
+
+        if distribution_cfg is not None:
+            distribution_cfg = distribution_cfg.copy()
+            dist_class: type[Distribution] = resolve_callable(distribution_cfg.pop("class_name"))  # type: ignore
+            self.distribution: Distribution | None = dist_class(output_dim, **distribution_cfg)
+            mlp_output_dim = self.distribution.input_dim
+        else:
+            self.distribution = None
+            mlp_output_dim = output_dim
+
         self.gcn_encoder = EquivGCNTemporalEncoder(
             node_dim=3,
             node_base_dim=9,
-            gcn_hidden_dim=self.gcn_hidden_dim,
-            gcn_out_dim=self.gcn_out_dim,
+            gcn_hidden_dim=gcn_hidden_dim,
+            gcn_out_dim=gcn_out_dim,
         )
+        self.fault_residual_encoder = FaultResidualTCN(
+            hidden_dim=tcn_hidden_dim,
+            film_dim=gcn_out_dim,
+        )
+        # tcn_path = "/home/dung-admin/quadloco_ws/quadlocofault/datasets/prop_fault/FTNet-Isaac-Velocity-Rough-Unitree-Go2-Play-v0/2026-07-27_11-45-57/fault_tcn_runs/2026-07-27_11-53-18/best.pt"
+        # self.fault_residual_encoder.load_state_dict(
+        #     torch.load(tcn_path, weights_only=False)['classifier_state_dict'], 
+        #     strict=False
+        #     )
+        # # Freeze the temporal feature extractor.
+        # self.fault_residual_encoder.tcn.requires_grad_(False)
 
-    def forward(self, obs, masks=None, hidden_state=None, stochastic_output: bool = False):
-        if self.setup != 1:
-            return super().forward(obs, masks, hidden_state, stochastic_output)
+        # # Explicitly keep both output heads trainable.
+        # self.fault_residual_encoder.fault_head.requires_grad_(True)
+        # self.fault_residual_encoder.film_head.requires_grad_(True)
+        
+        actor_input_dim = self.obs_dim + self.action_dim + gcn_out_dim
+        self.actor_mlp = MLP(actor_input_dim, mlp_output_dim, actor_hidden_dims, activation)
+        if self.distribution is not None:
+            self.distribution.init_mlp_weights(self.actor_mlp)
 
+    def forward(
+        self,
+        obs: TensorDict,
+        masks: torch.Tensor | None = None,
+        hidden_state: HiddenState = None,
+        stochastic_output: bool = False,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[int, torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
+    ]:
         obs_policy = self.obs_normalizer(obs["policy"])
         obs_history = self.obs_hist_normalizer(obs["history"])
         gcn_code = self.gcn_encoder(obs_history)
-        joint_code = gcn_code.index_select(1, self.gcn_encoder.joint_node_ids)
-        fault_logits = self.fault_predictor(joint_code).squeeze(-1)
+        gcn_latent = gcn_code.mean(dim=1)
+        fault_logits, gamma, beta = self.fault_residual_encoder(obs_history)
+        # fault_probability = torch.sigmoid(fault_logits).detach()
+        pos_weight = fault_logits.new_full(
+                    (fault_logits.shape[-1],), 1.0
+                ).to(fault_logits.device)
+        calibrated_logits = fault_logits - torch.log(
+            torch.as_tensor(pos_weight, device=fault_logits.device)
+        )
+        fault_probability = torch.sigmoid(calibrated_logits).detach()
+        fault_gate = fault_probability.amax(dim=1, keepdim=True)
+        fused_latent = (1.0 + fault_gate * gamma) * gcn_latent + fault_gate * beta
         actor_input = torch.cat(
-            (obs_policy, torch.sigmoid(fault_logits), gcn_code.mean(dim=1)), dim=-1
+            (obs_policy, fault_probability, fused_latent), dim=-1
         )
         mlp_output = self.actor_mlp(actor_input)
 
@@ -174,4 +334,56 @@ class EquivGCNActor(GCNActor):
                 action = self.distribution.deterministic_output(mlp_output)
         else:
             action = mlp_output
-        return action, (self.setup, fault_logits, None)
+        return action, (self.setup, fault_logits, (gamma, beta))
+
+    def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
+        pass
+
+    def get_hidden_state(self) -> HiddenState:
+        return None
+
+    def detach_hidden_state(
+        self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None
+    ) -> None:
+        pass
+
+    @property
+    def output_mean(self) -> torch.Tensor:
+        if self.distribution is None:
+            raise RuntimeError("EquivGCNActor has no output distribution.")
+        return self.distribution.mean
+
+    @property
+    def output_std(self) -> torch.Tensor:
+        if self.distribution is None:
+            raise RuntimeError("EquivGCNActor has no output distribution.")
+        return self.distribution.std
+
+    @property
+    def output_entropy(self) -> torch.Tensor:
+        if self.distribution is None:
+            raise RuntimeError("EquivGCNActor has no output distribution.")
+        return self.distribution.entropy
+
+    @property
+    def output_distribution_params(self) -> tuple[torch.Tensor, ...]:
+        if self.distribution is None:
+            raise RuntimeError("EquivGCNActor has no output distribution.")
+        return self.distribution.params
+
+    def get_output_log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        if self.distribution is None:
+            raise RuntimeError("EquivGCNActor has no output distribution.")
+        return self.distribution.log_prob(outputs)
+
+    def get_kl_divergence(
+        self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]
+    ) -> torch.Tensor:
+        if self.distribution is None:
+            raise RuntimeError("EquivGCNActor has no output distribution.")
+        return self.distribution.kl_divergence(old_params, new_params)
+
+    def update_normalization(self, obs: TensorDict) -> None:
+        if isinstance(self.obs_normalizer, EmpiricalNormalization):
+            self.obs_normalizer.update(obs["policy"])
+            self.obs_hist_normalizer.update(obs["history"])

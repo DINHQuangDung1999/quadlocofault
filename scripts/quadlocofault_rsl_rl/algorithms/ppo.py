@@ -350,7 +350,10 @@ class PPOFTNet(PPO):
                         param_group["lr"] = self.learning_rate
 
             # breakpoint()
-            selfsup_loss = nn.MSELoss()(priv_latent, hist_latent)
+            # Train the history encoder to imitate the privileged encoder.
+            # The privileged latent is the PPO-trained teacher and must not
+            # receive gradients from the self-supervised distillation loss.
+            selfsup_loss = nn.MSELoss()(hist_latent, priv_latent.detach())
             # Surrogate loss
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
             surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
@@ -503,7 +506,7 @@ class PPODreamFLEX(PPO):
             "PPODreamFLEX": PPODreamFLEX,
         }
         network_classes = {
-            "FTNetActor": DreamFLEXActor,
+            "FTNetActor": FTNetActor,
             "DreamFLEXActor": DreamFLEXActor,
             "MLPModel": MLPModel
         }
@@ -686,7 +689,7 @@ class PPODreamFLEX(PPO):
                         param_group["lr"] = self.learning_rate
             # Encoder loss
             code, code_vel, decode, mean_vel, logvar_vel, mean_latent, logvar_latent, fault_logit = latent_outputs
-            vel_target = batch.observations['critic'][:,49:52]
+            vel_target = batch.observations['critic'][:,45:48]
             fault_label_target = batch.observations['critic'][:,-12:]
             decode_target = batch.next_observations['policy']
             vel_target.requires_grad = False
@@ -695,7 +698,7 @@ class PPODreamFLEX(PPO):
             beta = 1.   
                   
             encoder_loss = (nn.MSELoss()(code_vel,vel_target) + nn.MSELoss()(decode,decode_target) \
-                            + beta*(-0.5 * torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp())))/self.num_mini_batches
+                            + beta*(-0.5 * torch.mean(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp())))
             # if encoder_loss.item() > 1e3:
             #     breakpoint()
             # Fault loss
@@ -859,7 +862,7 @@ class PPOPINN(PPO):
             "PPOPINN": PPOPINN,
         }
         network_classes = {
-            "FTNetActor": DreamFLEXActor,
+            "FTNetActor": FTNetActor,
             "DreamFLEXActor": DreamFLEXActor,
             "PINNActor": PINNActor,
             "MLPModel": MLPModel
@@ -1231,6 +1234,16 @@ class PPOGCN(PPO):
         self.storage = storage
         self.transition = RolloutStorage.Transition()
 
+    def _compute_fault_auxiliary_loss(
+        self,
+        extras: tuple,
+        fault_target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the optimization loss and supervised fault loss for GCNActor."""
+        _, fault_logits, _ = extras
+        fault_loss = nn.BCEWithLogitsLoss()(fault_logits, fault_target)
+        return fault_loss, fault_loss
+
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPOFTNet:
         """Construct the PPO algorithm."""
@@ -1244,7 +1257,7 @@ class PPOGCN(PPO):
             "PPOEquivGCN": PPOEquivGCN,
         }
         network_classes = {
-            "FTNetActor": DreamFLEXActor,
+            "FTNetActor": FTNetActor,
             "DreamFLEXActor": DreamFLEXActor,
             "PINNActor": PINNActor,
             "GCNActor": GCNActor,
@@ -1341,10 +1354,7 @@ class PPOGCN(PPO):
         mean_surrogate_loss = 0
         mean_entropy = 0
 
-        mean_vae_kl_loss = 0
-        mean_vae_recon_loss = 0
-        mean_disentangle_loss = 0
-        # mean_motor_loss = 0
+        mean_motors_strength_loss = 0
         mean_vel_loss = 0
         mean_fault_loss = 0
         mean_ctr_loss = 0
@@ -1455,53 +1465,56 @@ class PPOGCN(PPO):
             setup = extras[0]
             # breakpoint()
             if setup == 1:
+                def fault_binary_to_class_index(fault_binary: torch.Tensor) -> torch.Tensor:
+                    """Convert [..., 12] binary fault labels to [...] class indices.
+
+                    Classes 0-11: faulty joint index
+                    Class 12: no fault
+                    """
+                    has_fault = fault_binary.any(dim=-1)
+                    class_idx = fault_binary.float().argmax(dim=-1)
+                    class_idx = torch.where(has_fault, class_idx, torch.full_like(class_idx, 12))
+                    return class_idx.long()
                 # Encoder loss
                 # breakpoint()
                 # pred_vel, fault_logits, code_latent, mean_latent, logvar_latent, code_phys, code_terrain, pred_height_map = extras
-                _, pred_vel, fault_logits, code_phys = extras
-                vel_target = batch.observations['critic'][:,-32:-29]
+                # _, scandots_pred, scandots_code, mean_scandots_code, logvar_scandots_code, fault_logits, gcn_code = extras
+                # vel_target = batch.observations['critic'][:,-32:-29]
                 fault_label_target = batch.observations['critic'][:,-12:]
+                # fault_class_target = fault_binary_to_class_index(fault_label_target)
                 # decode_target = batch.next_observations['policy']
-                decode_target = batch.observations['critic'][:,49:49+187]
-                # decode_motor_target = batch.observations['critic'][:,-24:-12]
-                vel_target.requires_grad = False
-                fault_label_target.requires_grad = False
-                decode_target.requires_grad = False   
-                # decode_motor_target.requires_grad = False   
+                # scandots_target = batch.observations['critic'][:,48:48+187]
+                # motors_strength_target = batch.observations['critic'][:,-24:-12]
+
+                # scandots_target.requires_grad = False
+                # fault_label_target.requires_grad = False
+                # fault_class_target.requires_grad = False
                 
-                beta = 1.  
-                vel_loss = nn.MSELoss()(pred_vel, vel_target)
-                # motor_loss = nn.MSELoss()(pred_motors_strength,decode_motor_target)
-                # vae_kl_loss = beta*(-0.5 * torch.mean(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp()))
-                # vae_recon_loss = nn.MSELoss()(pred_height_map, decode_target)
-                def disentangle_loss_fn(code_phys: torch.Tensor, code_terrain: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-                    # [B, D]
-                    z1 = code_phys - code_phys.mean(dim=0, keepdim=True)
-                    z2 = code_terrain - code_terrain.mean(dim=0, keepdim=True)
+                # motors_strength_target.requires_grad = False
 
-                    z1 = z1 / (z1.std(dim=0, keepdim=True) + eps)
-                    z2 = z2 / (z2.std(dim=0, keepdim=True) + eps)
-
-                    # Cross-correlation / normalized cross-covariance matrix: [D, D]
-                    c = (z1.T @ z2) / z1.shape[0]
-
-                    # Penalize all correlation between the two subspaces
-                    return (c ** 2).mean()
-                # disentangle_loss = disentangle_loss_fn(code_phys, code_terrain)
-                # disentangle_loss = abs(nn.CosineSimilarity(dim = -1)(code_terrain, code_phys)).mean()
-                # if encoder_loss.item() > 1e3:
-                #     breakpoint()
+                # beta = 1.
+                # scandots_encoder_loss = (scandots_error**2).mean()
+                # scandots_encoder_loss += beta*(-0.5 * torch.mean(1 + logvar_scandots_code - mean_scandots_code.pow(2) - logvar_scandots_code.exp()))
+                fault_auxiliary_loss, fault_loss = self._compute_fault_auxiliary_loss(
+                    extras, fault_label_target
+                )
+                scandots_encoder_loss = fault_loss.new_zeros(())
                 # Fault loss
-                fault_loss = nn.BCEWithLogitsLoss()(fault_logits, fault_label_target)
-                print((torch.sigmoid(fault_logits) < 0.5).float().mean())
+                # breakpoint()
+                # fault_loss = nn.CrossEntropyLoss()(fault_logits, fault_class_target)
+                # motors_strength_loss = nn.MSELoss()(motors_strength, motors_strength_target)
+                # print((torch.sigmoid(fault_logits) < 0.5).float().mean())
                 # ((torch.sigmoid(fault_logits) > 0.5) == fault_label_target).float().mean()
                 # breakpoint()
-                if fault_loss.item() > 0.15:
-                    breakpoint()
+                # if fault_loss.item() > 0.15:
+                #     breakpoint()
                 # breakpoint()
                 # loss += vel_loss + vae_kl_loss + vae_recon_loss + disentangle_loss + fault_loss 
-                loss += vel_loss  + fault_loss 
-            
+                # loss += scandots_encoder_loss + fault_loss
+                # loss += motors_strength_loss + fault_loss
+                loss += fault_auxiliary_loss
+                motors_strength_loss = fault_loss.new_zeros(())
+                phys_encoder_loss = fault_loss.new_zeros(())
             elif setup == 2:
                 _ , priv_phys_z, priv_scandots_z, hist_to_scandots_z, gcn_z = extras
                 scandots_encoder_loss = nn.MSELoss()(priv_phys_z, gcn_z)
@@ -1647,7 +1660,8 @@ class PPOGCN(PPO):
             # mean_vae_kl_loss += vae_kl_loss.item()
             # mean_vae_recon_loss += vae_recon_loss.item()
             # mean_disentangle_loss += disentangle_loss.item()
-            # mean_fault_loss += fault_loss.item()
+            mean_motors_strength_loss += motors_strength_loss.item()
+            mean_fault_loss += fault_loss.item()
             # mean_ctr_loss += ctr_loss.item()
             # mean_priv_encode_loss += priv_encode_loss.item()
             mean_scandots_encoder_loss += scandots_encoder_loss.item()
@@ -1694,11 +1708,12 @@ class PPOGCN(PPO):
             # "vae_kl": mean_vae_kl_loss,
             # "vae_recon": mean_vae_recon_loss,
             # "disentangle": mean_disentangle_loss,
-            # "fault": mean_fault_loss,
+            # "motor": mean_motors_strength_loss,
+            "fault": mean_fault_loss,
             # "ctr": mean_ctr_loss,
             # "priv_encode": mean_priv_encode_loss,
             "scandots_encoder": mean_scandots_encoder_loss,
-            "phys_encoder": mean_phys_encoder_loss,
+            # "phys_encoder": mean_phys_encoder_loss,
         })
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
@@ -1712,3 +1727,45 @@ class PPOEquivGCN(PPOGCN):
     """PPOGCN variant selecting the symmetry-biased EquivGCNActor."""
 
     actor: EquivGCNActor
+
+    def __init__(
+        self,
+        actor: EquivGCNActor,
+        critic: MLPModel,
+        storage: RolloutStorage,
+        *args,
+        fault_pos_weight: float = 1.0,
+        **kwargs,
+    ):
+        if fault_pos_weight <= 0.0:
+            raise ValueError(f"fault_pos_weight must be positive, got {fault_pos_weight}.")
+        self.fault_pos_weight = float(fault_pos_weight)
+        super().__init__(actor, critic, storage, *args, **kwargs)
+
+    def _compute_fault_auxiliary_loss(
+        self,
+        extras: tuple,
+        fault_target: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Weight the faulty joint and add FiLM regularization."""
+        _, fault_logits, film = extras
+        gamma, beta = film
+        pos_weight = fault_logits.new_full(
+            (fault_logits.shape[-1],), self.fault_pos_weight
+        )
+        fault_loss = nn.functional.binary_cross_entropy_with_logits(
+            fault_logits,
+            fault_target.to(dtype=fault_logits.dtype),
+            pos_weight=pos_weight,
+        )
+
+        film_energy = gamma.square().mean(dim=-1) + beta.square().mean(dim=-1)
+        healthy_mask = ~fault_target.bool().any(dim=-1)
+        if healthy_mask.any():
+            healthy_film_loss = film_energy[healthy_mask].mean()
+        else:
+            healthy_film_loss = film_energy.new_zeros(())
+        film_reg_loss = film_energy.mean()
+
+        auxiliary_loss = fault_loss + 0.1 * healthy_film_loss + 1.0e-4 * film_reg_loss
+        return auxiliary_loss, fault_loss

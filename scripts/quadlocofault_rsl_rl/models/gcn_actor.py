@@ -15,11 +15,7 @@ from rsl_rl.models.mlp_model import MLPModel
 from modules import CNN1D, GCNLayer, TemporalConvBlock
 from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
 from rsl_rl.modules.distribution import Distribution
-from rsl_rl.utils import resolve_callable, unpad_trajectories, resolve_nn_activation
-
-from torchdiffeq import odeint_adjoint
-from torchdiffeq import odeint
-import numpy as np 
+from rsl_rl.utils import resolve_callable
 import torch.nn.functional as F
 
 
@@ -32,54 +28,67 @@ class GCNTemporalEncoder(nn.Module):
         projection_dim: int,
         gcn_hidden_dim: int,
         tcn_hidden_dim: int,
+        tcn_out_dim: int,
+        gcn_out_dim: int,
         edges: list[tuple[int, int]],
-        setup: int,
+        encoder_type: str = 'mlp'
     ) -> None:
         super().__init__()
-
+        tcn_out_dim = 32
         self.node_dim = node_dim
         self.node_base_dim = node_base_dim
         self.num_nodes = num_nodes
         self.num_joints = num_nodes - 1
-
+        self.projection_dim = projection_dim
+        self.tcn_hidden_dim = tcn_hidden_dim
+        self.gcn_hidden_dim = gcn_hidden_dim
+        self.tcn_out_dim = tcn_out_dim
+        self.gcn_out_dim = gcn_out_dim
+        self.encoder_type = encoder_type
         adj = self._build_adj(num_nodes, edges)
         self.register_buffer("adj_norm", self._normalize_adj(adj))
         self.register_buffer("joint_permutation", torch.tensor([0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11], dtype=torch.long))
+        # ``joint_permutation`` converts Isaac Lab joint order into GCN node
+        # order (grouped by leg). Predictions returned to PPO must use the
+        # original Isaac Lab order so they align with ``faulty_joint_idx``.
+        self.register_buffer("inverse_joint_permutation", torch.argsort(self.joint_permutation))
 
-        self.node_base_projection = nn.Linear(node_base_dim, projection_dim)
-        self.node_joint_projection = nn.Linear(node_dim, projection_dim)
-
-        self.setup = setup
-        if self.setup == 1:
-            self.gcn1 = GCNLayer(projection_dim, gcn_hidden_dim)
-            self.gcn2 = GCNLayer(gcn_hidden_dim, gcn_hidden_dim)
-        elif self.setup == 2:
-            self.temporal_conv = nn.Sequential(
-                TemporalConvBlock(gcn_hidden_dim, tcn_hidden_dim, kernel_size=3, dilation=1),
+        # obs_dim = self.node_base_dim + self.num_joints * self.node_dim
+        # dim_node_joint_feats = self.num_joints * self.node_dim # 36
+        if self.encoder_type == 'tcn':
+            self.temporal_conv_joint = nn.Sequential(
+                TemporalConvBlock(self.node_dim, tcn_hidden_dim, kernel_size=3, dilation=1),
                 TemporalConvBlock(tcn_hidden_dim, tcn_hidden_dim, kernel_size=3, dilation=2),
-                TemporalConvBlock(tcn_hidden_dim, gcn_hidden_dim, kernel_size=3, dilation=4),
+                TemporalConvBlock(tcn_hidden_dim, tcn_out_dim, kernel_size=3, dilation=4),
             )
-            self.gcn1 = GCNLayer(projection_dim, gcn_hidden_dim)
-            self.gcn2 = GCNLayer(gcn_hidden_dim, gcn_hidden_dim)
-        # self.pre_temporal_mlp = nn.Sequential(
-        #     nn.Linear(node_base_dim + self.num_joints * self.node_dim + 4, 256),
-        #     nn.ReLU(),
-        #     nn.Linear(256, 128),
-        #     nn.ReLU(),
-        #     nn.Linear(128, gcn_hidden_dim),
-        # )
 
-        # self.temporal_encoder = nn.GRU(
-        #     input_size=gcn_hidden_dim,
-        #     hidden_size=tcn_hidden_dim,
-        #     batch_first=True,
-        # )
-        # self.temporal_conv = nn.Sequential(
-        #     TemporalConvBlock(gcn_hidden_dim, tcn_hidden_dim, kernel_size=3, dilation=1),
-        #     TemporalConvBlock(tcn_hidden_dim, tcn_hidden_dim, kernel_size=3, dilation=2),
-        #     TemporalConvBlock(tcn_hidden_dim, tcn_hidden_dim, kernel_size=3, dilation=4),
-        # )
+            self.temporal_conv_base = nn.Sequential(
+                TemporalConvBlock(self.node_base_dim, tcn_hidden_dim, kernel_size=3, dilation=1),
+                TemporalConvBlock(tcn_hidden_dim, tcn_hidden_dim, kernel_size=3, dilation=2),
+                TemporalConvBlock(tcn_hidden_dim, tcn_out_dim, kernel_size=3, dilation=4),
+            )
+        elif self.encoder_type == 'mlp':
+            self.mlp_joint = nn.Sequential(
+                nn.LazyLinear(128),
+                nn.ELU(),
+                nn.Linear(128, 64),
+                nn.ELU(),
+                nn.Linear(64, 32)
+            )
 
+            self.mlp_base = nn.Sequential(
+                nn.LazyLinear(128),
+                nn.ELU(),
+                nn.Linear(128, 64),
+                nn.ELU(),
+                nn.Linear(64, 32)
+            )
+        # self.node_base_projection = nn.Linear(self.node_base_dim, self.projection_dim)
+        # self.node_joint_projection = nn.Linear(self.node_dim, self.projection_dim)
+
+        self.gcn1 = GCNLayer(32, gcn_hidden_dim)
+        self.gcn2 = GCNLayer(gcn_hidden_dim, gcn_out_dim)
+        # self.gcn3 = GCNLayer(gcn_hidden_dim, gcn_out_dim)
 
     @staticmethod
     def _build_adj(num_nodes: int, edges: list[tuple[int, int]]) -> torch.Tensor:
@@ -107,54 +116,39 @@ class GCNTemporalEncoder(nn.Module):
         # 'RR_hip_joint', 'FL_thigh_joint', 'FR_thigh_joint', 
         # 'RL_thigh_joint', 'RR_thigh_joint', 'FL_calf_joint', 
         # 'FR_calf_joint', 'RL_calf_joint', 'RR_calf_joint']
-        # hid = self.pre_temporal_mlp(x)
-        def _obs_to_graph(x):
-            x_base = x[:, :, 36:]
-            pos, vel, a_prev = x[:, :, :12], x[:, :, 12:24], x[:, :, 24:36]
-            x_joints = torch.stack(
-                [
-                    pos[:, :, self.joint_permutation],
-                    vel[:, :, self.joint_permutation],
-                    a_prev[:, :, self.joint_permutation],
-                ],
-                dim=-1,
-            )
 
-            x_base = self.node_base_projection(x_base).unsqueeze(2)
-            x_joints = self.node_joint_projection(x_joints)
-            
-            x_graphs = torch.cat([x_joints, x_base], dim=2)   
-            return x_graphs
-        # GCN path kept here for comparison against the simpler per-timestep MLP encoder.
-        if self.setup == 1:
-            # breakpoint()
-            # Merge batch and time before message passing to avoid expensive 4D contractions.
-            x_graphs = _obs_to_graph(x)
-            hid = F.elu(self.gcn1(x_graphs, self.adj_norm))
-            hid = F.elu(self.gcn2(hid, self.adj_norm))
-            hid = hid.mean(dim=2).reshape(hid.shape[0], -1)
-            return hid
-        
-        if self.setup == 2:
-            # breakpoint()
-            x_code = x.permute(0, 2, 1)
-            x_code = self.temporal_conv(x_code)
-            x_graphs = _obs_to_graph(x_code)
+        x_base = x[:, :, 36:]
+        pos, vel, a_prev = x[:, :, :12], x[:, :, 12:24], x[:, :, 24:36]
+        x_joints = torch.stack(
+            [
+                pos[:, :, self.joint_permutation],
+                vel[:, :, self.joint_permutation],
+                a_prev[:, :, self.joint_permutation],
+            ],
+            dim=-1,
+        )
+        B, H, D = x.shape
+        if self.encoder_type == 'tcn':
+            x_joints = x_joints.permute(0,2,3,1).flatten(0,1)
+            x_joints = self.temporal_conv_joint(x_joints)
+            x_joints = x_joints.view(B, self.num_joints, self.tcn_out_dim, H).mean(dim = -1)
+
+            x_base = x_base.permute(0,2,1)
+            x_base = self.temporal_conv_base(x_base).mean(dim = -1).unsqueeze(1)
+        elif self.encoder_type == 'mlp':
+            x_joints = x_joints.permute(0,2,1,3).flatten(2,3)
+            x_joints = self.mlp_joint(x_joints)
+
+            x_base = self.mlp_base(x_base.flatten(1,2)).unsqueeze(1)
+        x_graphs = torch.concat([x_joints, x_base], dim = 1)
+
         # breakpoint()
-        # hid = hid.view(batch_size, history_length, -1)
+        hid = F.elu(self.gcn1(x_graphs, self.adj_norm))
+        hid = F.elu(self.gcn2(hid, self.adj_norm))
+        # hid = F.elu(self.gcn3(hid, self.adj_norm))
+        # breakpoint()
+        return hid
 
-        # GRU baseline kept here for reference.
-        # out, _ = self.temporal_encoder(hid)
-        # last = out.mean(1) 
-        # last = hid.mean(1)
-        # return last
-        # hid = hid.transpose(1, 2)
-        # hid = self.temporal_conv(hid)
-        # return hid.mean(-1)
-        # # last = hid[:, :, -1]
-        # last = hid.mean(-1)
-        # # breakpoint()
-        
     
 class GCNActor(nn.Module):
 
@@ -171,9 +165,11 @@ class GCNActor(nn.Module):
         actor_hidden_dims: tuple[int, ...] | list[int] = (512, 256, 128),
         projection_dim: int = 8,
         gcn_hidden_dim: int = 16,
-        tcn_hidden_dim: int = 16,
+        tcn_hidden_dim: int = 8,
+        tcn_out_dim: int = 4,
+        gcn_out_dim: int = 16,
         latent_dim: int = 16,
-        setup=2,
+        setup=1,
     ) -> None:
         """Initialize the MLP-based model.
 
@@ -193,6 +189,12 @@ class GCNActor(nn.Module):
         self.latent_dim = latent_dim
         self.action_dim = output_dim
         self.setup = setup 
+
+        self.projection_dim = projection_dim
+        self.tcn_hidden_dim = tcn_hidden_dim
+        self.gcn_hidden_dim = gcn_hidden_dim
+        self.tcn_out_dim = tcn_out_dim
+        self.gcn_out_dim = gcn_out_dim
 
         # Observation normalization
         self.obs_normalization = obs_normalization
@@ -236,22 +238,45 @@ class GCNActor(nn.Module):
             projection_dim=projection_dim,
             gcn_hidden_dim=gcn_hidden_dim,
             tcn_hidden_dim=tcn_hidden_dim,
+            gcn_out_dim=gcn_out_dim,
+            tcn_out_dim=tcn_out_dim,
             edges=edges,
-            setup=1,
         )
 
-        # self.latent_head = nn.Sequential(
-        #     nn.Linear(tcn_hidden_dim * self.obs_hist_length, latent_dim * 2),
-        #     nn.ELU(),
-        #     nn.Linear(latent_dim * 2, latent_dim),
-        # )
-        self.latent_head = nn.Linear(gcn_hidden_dim * self.obs_hist_length, latent_dim)
         if setup == 1:
-            self.vel_head = nn.Linear(latent_dim, 3)
-            self.fault_head = nn.Linear(latent_dim, self.action_dim)
-
-            actor_dim = self.obs_dim + 3 + self.action_dim
+            # self.scandots_code_dim = 16
+            # self.scandots_encoder = nn.Sequential(nn.Linear(187, 128),
+            #                                     nn.ELU(),
+            #                                     nn.Linear(128,64),
+            #                                     nn.ELU(),
+            #                                     nn.Linear(64,16)
+            #                                     )
+            # self.history_to_scandots_encoder = nn.Sequential(
+            #     TemporalConvBlock(self.obs_dim, 32, kernel_size=3, dilation=1),
+            #     TemporalConvBlock(32, 32, kernel_size=3, dilation=2),
+            #     TemporalConvBlock(32, 32, kernel_size=3, dilation=4),
+            # )
+            # self.history_to_scandots_encoder_final_mlp = nn.LazyLinear(self.scandots_code_dim)
+            # self.history_to_scandots_mlp = nn.Sequential(nn.Linear(32 * self.obs_hist_length, 128),
+            #                                       nn.ELU(),
+            #                                       nn.Linear(128, self.scandots_code_dim),
+            #                                     #   nn.ELU(),
+            #                                     #   nn.Linear(128, self.scandots_code_dim))
+            # )
+            self.fault_predictor = nn.Linear(gcn_out_dim, 1)
+            self.motors_strength_predictor = nn.Linear(gcn_out_dim * 13, self.action_dim)
+            self.fault_affine_gate_regressor = nn.Sequential(
+                nn.Linear(self.action_dim + 1, 64),
+                nn.ReLU(),
+                nn.Linear(64, 64),
+                nn.ReLU(),
+                nn.Linear(64, gcn_out_dim * 2),
+            )
+            # actor_dim = self.obs_dim + 12 + self.scandots_code_dim + gcn_out_dim
+            # actor_dim = self.obs_dim + self.action_dim + 1 + self.action_dim + gcn_out_dim
+            actor_dim = self.obs_dim + self.action_dim + gcn_out_dim 
         if setup == 2:
+            self.latent_head = nn.Linear(gcn_hidden_dim * self.obs_hist_length, latent_dim)
             self.scandots_encoder = nn.Sequential(nn.Linear(187, 128),
                                                   nn.ELU(),
                                                   nn.Linear(128,64),
@@ -316,23 +341,38 @@ class GCNActor(nn.Module):
         if self.setup == 1:
             obs_policy = self.obs_normalizer(obs['policy'])
             obs_hist = self.obs_hist_normalizer(obs['history'])
-            # obs_critic = self.obs_critic_normalizer(obs['critic'])
-            code = self.gcn_encoder(obs_hist)
-            code = self.latent_head(code)
+            obs_critic = self.obs_hist_normalizer(obs['critic'])
+
+            # # TCN encodes the terrain awareness via VAE style
+            # scandots_code = self.history_to_scandots_encoder(obs_hist.flatten(1,2))
             # breakpoint()
-            # code_phys, code_terrain = code[:, :self.latent_dim], code[:, self.latent_dim:]
-            code_phys = code
-            pred_vel = self.vel_head(code_phys)
-            fault_logits = self.fault_head(code_phys)
-            # mean_latent = self.mean_latent_head(code_terrain)
-            # logvar_latent = self.logvar_latent_head(code_terrain)
-            # code_latent = self.reparameterise(mean_latent, logvar_latent)
+            # scandots_code = self.history_to_scandots_encoder(obs_hist.permute(0,2,1)).flatten(1,2)
+            # scandots_code = self.history_to_scandots_mlp(scandots_code)
+            # scandots_target = self.scandots_encoder(obs_critic[:,48:48+187])
+            # scandots_error = scandots_code - scandots_target.detach()
+            # mean_scandots_code, var_scandots_co   de = scandots_code[:,:scandots_code.shape[-1]//2], scandots_code[:,scandots_code.shape[-1]//2:]
+            # scandots_code = self.reparameterise(mean_scandots_code, var_scandots_code)
+            # scandots_pred = self.history_to_scandots_decoder(scandots_code)
+            # GCN encodes the dynamics and is gated by the fault prediction
+            # breakpoint()
+            gcn_code = self.gcn_encoder(obs_hist)
+            # breakpoint()
+            # fault_logits = self.fault_predictor(gcn_code.flatten(1,2))
+            fault_logits_gcn_order = self.fault_predictor(gcn_code[:, :12, :]).squeeze(-1)
+            fault_logits = fault_logits_gcn_order[:, self.gcn_encoder.inverse_joint_permutation]
+            # motors_strength = self.motors_strength_predictor(gcn_code.flatten(1,2))
+            # gamma = self.fault_affine_gate_regressor(fault_logits)
+            # gamma1, gamma2 = gamma[:,:gcn_code.shape[-1]], gamma[:,gcn_code.shape[-1]:]
+            # gcn_code = gamma1 + gamma2 * gcn_code.mean(1)
             
-            # pred_height_map = self.vae_decoder(code_latent)
-            # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
-            # Action
-            # actor_input = torch.cat([obs_policy, pred_vel, torch.sigmoid(fault_logits), code_latent], dim = -1)
-            actor_input = torch.cat([obs_policy, pred_vel, torch.sigmoid(fault_logits)], dim = -1)
+            # breakpoint()
+            # actor_input = torch.cat([obs_policy, torch.sigmoid(fault_logits), gcn_code, scandots_code], dim = -1)
+            # actor_input = torch.cat([obs_policy, gcn_code, motors_strength], dim = -1)
+            actor_input = torch.cat([obs_policy, torch.sigmoid(fault_logits), gcn_code.mean(1)], dim = -1)
+            # if self.training:
+            #     actor_input = torch.cat([obs_policy, torch.sigmoid(fault_logits), gcn_code.mean(1), scandots_target], dim = -1)
+            # else:
+            #     actor_input = torch.cat([obs_policy, torch.sigmoid(fault_logits), gcn_code.mean(1), scandots_code], dim = -1)
             mlp_output = self.actor_mlp(actor_input)
             if self.distribution is not None:
                 if stochastic_output:
@@ -341,7 +381,9 @@ class GCNActor(nn.Module):
                 else:
                     action = self.distribution.deterministic_output(mlp_output)
             # return action, (pred_vel, fault_logits, code_latent, mean_latent, logvar_latent, code_phys, code_terrain, pred_height_map)
-            return action, (self.setup, pred_vel, fault_logits, code_phys)
+            # return action, (self.setup, scandots_pred, scandots_code, mean_scandots_code, var_scandots_code, \
+            #                 fault_logits, gcn_code)
+            return action, (self.setup, fault_logits, None)
         
         elif self.setup == 2:
             obs_policy = self.obs_normalizer(obs['policy'])
