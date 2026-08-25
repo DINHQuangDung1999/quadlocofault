@@ -3,412 +3,908 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Play an RSL-RL policy and collect DreamFLEX/FT-Net evaluation data.
+"""Evaluate GCN, EquivGCN, FTNet, and DreamFLEX baseline checkpoints.
 
-DreamFLEX reports ATE as the absolute error between commanded and measured
-linear velocity (m/s), along with foot-contact histories. FT-Net compares the
-commanded and measured velocity through time. This evaluator saves all three.
+Two protocols are provided:
+
+* ``rough``: fault timing inherited from the evaluation environment, command
+  ``(0.5, 0, 0)``, and mean capped
+  locomotion lifetime plus termination-aware distance success over 4000
+  environments for six terrain families and fault coefficients 0.0 and 0.1.
+* ``flat``: flat ground, command ``(1, 0, 0)``, fault injected at 3 s, and a
+  10 s episode. Forward-velocity ATE and a representative foot-contact
+  diagram are saved.
+
+Isaac Sim is launched in a fresh worker process for each experiment. The
+parent process persists every completed worker immediately and resumes by
+skipping matching rows already present in the protocol CSV files.
 """
 
+from __future__ import annotations
+
 import argparse
-import importlib.metadata as metadata
+import csv
 import json
+import math
 import os
+import subprocess
 import sys
-import time
+import tempfile
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
 
-# local imports
 import cli_args  # isort: skip
 
 
-parser = argparse.ArgumentParser(description="Play an RSL-RL policy and record velocity-tracking ATE.")
-parser.add_argument("--video", action="store_true", default=False, help="Record a video of the evaluation.")
-parser.add_argument("--video_length", type=int, default=None, help="Video length in steps (defaults to the evaluation length).")
-parser.add_argument("--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O.")
-parser.add_argument("--num_envs", type=int, default=100, help="Number of parallel environments (paper: 100).")
-parser.add_argument("--task", type=str, default=None, help="Gym task name.")
-parser.add_argument("--agent", type=str, default="rsl_rl_cfg_entry_point", help="RL agent config entry point.")
-parser.add_argument("--seed", type=int, default=None, help="Environment seed.")
-parser.add_argument("--use_pretrained_checkpoint", action="store_true", help="Use a published checkpoint.")
-parser.add_argument("--duration", type=float, default=10.0, help="Metric collection duration in seconds (paper: 10).")
-parser.add_argument("--warmup", type=float, default=0.0, help="Warm-up duration excluded from metrics, in seconds.")
-parser.add_argument("--num_episodes", type=int, default=1, help="Number of fixed-duration evaluation episodes.")
+MODELS = ("GCN", "EquivGCN", "EquivGCNMLP", "FTNet", "FLEX")
+FAULT_COEFFICIENTS = (0.0, 0.1)
+JOINT_NAMES = (
+    "FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint",
+    "FL_thigh_joint", "FR_thigh_joint", "RL_thigh_joint", "RR_thigh_joint",
+    "FL_calf_joint", "FR_calf_joint", "RL_calf_joint", "RR_calf_joint",
+)
+TERRAINS = {
+    "rough": "random_rough",
+    "grid": "grid",
+    # Robots spawn on the center platform and travel outwards.  The regular
+    # pyramid variants have a high center, so outward travel is downhill;
+    # the inverted variants have a low center, so outward travel is uphill.
+    "slope_up": "hf_pyramid_slope_inv",
+    "slope_down": "hf_pyramid_slope",
+    "stairs_up": "pyramid_stairs_inv",
+    "stairs_down": "pyramid_stairs",
+}
+EVAL_TASKS = {
+    model: f"{model}-Isaac-Velocity-Eval-Unitree-Go2-v0" for model in MODELS
+}
+EXPERIMENTS = {
+    "GCN": "unitree_go2_rough_gcn",
+    "EquivGCN": "unitree_go2_rough_equiv_gcn",
+    "EquivGCNMLP": "unitree_go2_rough_equiv_gcn_mlp",
+    "FTNet": "unitree_go2_rough_ftnet",
+    "FLEX": "unitree_go2_rough_flex",
+}
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--protocol", choices=("all", "rough", "flat"), default="all")
+parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
 parser.add_argument(
-    "--distance_failure_ratio",
+    "--terrains",
+    nargs="+",
+    choices=tuple(TERRAINS),
+    default=None,
+    help=(
+        "Rough-terrain families to evaluate (default: all). For example, "
+        "--terrains slope_down stairs_up stairs_down resumes from slope_down."
+    ),
+)
+parser.add_argument("--num_envs", type=int, default=4000)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=None,
+    help="Environment seed for a single worker (normally set through --eval_seeds).",
+)
+parser.add_argument("--rough_duration", type=float, default=20.0)
+parser.add_argument(
+    "--success_distance",
+    type=float,
+    default=None,
+    help=(
+        "Forward distance in metres required for rough-terrain success. "
+        "Defaults to half the terrain-tile length minus --success_distance_margin."
+    ),
+)
+parser.add_argument(
+    "--success_distance_margin",
+    type=float,
+    default=0.25,
+    help="Safety margin subtracted from half the terrain-tile length.",
+)
+parser.add_argument(
+    "--success_confirmation_time",
     type=float,
     default=0.5,
-    help="Fail an episode when traveled distance is below this fraction of commanded distance.",
+    help="Time the robot must remain non-terminated after reaching the target distance.",
 )
-parser.add_argument("--command_x", type=float, default=1.0, help="Fixed forward velocity command in m/s.")
-parser.add_argument("--command_y", type=float, default=0.0, help="Fixed lateral velocity command in m/s.")
-parser.add_argument("--command_yaw", type=float, default=0.0, help="Fixed yaw-rate command in rad/s.")
-parser.add_argument("--command_name", type=str, default="base_velocity", help="Velocity command term name.")
-parser.add_argument("--asset_name", type=str, default="robot", help="Scene articulation used for velocity measurement.")
-parser.add_argument("--metrics_path", type=str, default=None, help="Output JSON path (default: checkpoint/eval/ate.json).")
-parser.add_argument("--timeseries_npz", type=str, default=None, help="NPZ path (default: checkpoint/eval/timeseries.npz).")
-parser.add_argument("--plot_path", type=str, default=None, help="Plot path (default: checkpoint/eval/tracking.png).")
-parser.add_argument("--contact_sensor_name", type=str, default="contact_forces", help="Contact sensor scene key.")
-parser.add_argument("--foot_body_regex", type=str, default=".*_foot", help="Contact-sensor foot body regex.")
-parser.add_argument("--contact_threshold", type=float, default=1.0, help="Foot-contact force threshold in N.")
-parser.add_argument("--plot_env_id", type=int, default=0, help="Environment shown in contact/tracking curves.")
-parser.add_argument("--real-time", action="store_true", default=False, help="Throttle simulation to wall-clock time.")
+parser.add_argument("--flat_duration", type=float, default=10.0)
+parser.add_argument("--fault_time", type=float, default=3.0)
+parser.add_argument(
+    "--fault_joint",
+    choices=JOINT_NAMES,
+    default=None,
+    help=(
+        "Optional joint that receives the actuator fault. If omitted, each "
+        "environment samples a faulty joint randomly."
+    ),
+)
+parser.add_argument(
+    "--fault_joints",
+    nargs="+",
+    choices=JOINT_NAMES,
+    default=None,
+    help=(
+        "Parent-mode sweep over explicit faulty joints. Results are saved "
+        "separately for every joint and seed."
+    ),
+)
+parser.add_argument(
+    "--eval_seeds",
+    nargs="+",
+    type=int,
+    default=None,
+    help="Parent-mode evaluation seeds (default: --seed, or 0 when unset).",
+)
+parser.add_argument("--terrain_difficulty_min", type=float, default=0.5)
+parser.add_argument("--terrain_difficulty_max", type=float, default=0.7)
+parser.add_argument("--contact_threshold", type=float, default=1.0)
+parser.add_argument("--plot_env_id", type=int, default=0)
+parser.add_argument(
+    "--flex_history_length",
+    type=int,
+    default=5,
+    help=(
+        "DreamFLEX history horizon. Use 5 for newly trained models (default), "
+        "or 30 only to evaluate legacy checkpoints trained before the fix."
+    ),
+)
+parser.add_argument("--output_dir", type=str, default=None)
+parser.add_argument(
+    "--resume-eval",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Skip cases already saved for the same checkpoint and number of environments (default: true).",
+)
+parser.add_argument(
+    "--latest_run_name",
+    type=str,
+    default="baseline",
+    help=(
+        "Run directory below logs/rsl_rl/<experiment>/ used for automatic "
+        "checkpoint selection (default: baseline)."
+    ),
+)
+parser.add_argument("--equivgcn_checkpoint", type=str, default=None)
+parser.add_argument("--equiv_gcn_mlp_checkpoint", type=str, default=None)
+parser.add_argument("--gcn_checkpoint", type=str, default=None)
+parser.add_argument("--ftnet_checkpoint", type=str, default=None)
+parser.add_argument("--flex_checkpoint", type=str, default=None)
+parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+parser.add_argument("--model", choices=MODELS, default=None, help=argparse.SUPPRESS)
+parser.add_argument("--terrain", choices=tuple(TERRAINS), default=None, help=argparse.SUPPRESS)
+parser.add_argument("--fault_coef", type=float, default=None, help=argparse.SUPPRESS)
+parser.add_argument("--result_json", type=str, default=None, help=argparse.SUPPRESS)
+parser.add_argument("--task", type=str, default=None, help=argparse.SUPPRESS)
+parser.add_argument(
+    "--agent",
+    type=str,
+    default="rsl_rl_cfg_entry_point",
+    help="Gym registry entry point used to load the RSL-RL agent configuration.",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
-if args_cli.video:
-    args_cli.enable_cameras = True
 
-sys.argv = [sys.argv[0]] + hydra_args
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
 
 
-import gymnasium as gym
-import numpy as np
-import torch
-from packaging import version
-from rsl_rl.runners import DistillationRunner
-from runners import CustomOnPolicyRunner
-
-from isaaclab.envs import DirectMARLEnv, DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg, multi_agent_to_single_agent
-from isaaclab.utils.assets import retrieve_file_path
-from isaaclab.utils.dict import print_dict
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, handle_deprecated_rsl_rl_cfg
-from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from isaaclab_tasks.utils import get_checkpoint_path
-from isaaclab_tasks.utils.hydra import hydra_task_config
-from isaaclab_quadlocofault_rl.rsl_rl import CustomRslRlVecEnvWrapper
-
-import isaaclab_tasks  # noqa: F401
-import isaaclab_quadlocofault_tasks  # noqa: F401
-
-
-installed_version = metadata.version("rsl-rl-lib")
-
-
-def _set_fixed_velocity_command(env_cfg) -> None:
-    """Make the requested velocity command deterministic for the whole evaluation."""
-    try:
-        command_cfg = getattr(env_cfg.commands, args_cli.command_name)
-    except AttributeError as exc:
-        raise ValueError(f"Task has no command term named '{args_cli.command_name}'.") from exc
-    command_cfg.heading_command = False
-    command_cfg.rel_heading_envs = 0.0
-    command_cfg.rel_standing_envs = 0.0
-    command_cfg.resampling_time_range = (args_cli.duration + args_cli.warmup + 1.0,) * 2
-    command_cfg.ranges.lin_vel_x = (args_cli.command_x, args_cli.command_x)
-    command_cfg.ranges.lin_vel_y = (args_cli.command_y, args_cli.command_y)
-    command_cfg.ranges.ang_vel_z = (args_cli.command_yaw, args_cli.command_yaw)
-
-
-def _write_npz(
-    path: str,
-    rows: list[dict[str, float]],
-    episode_arrays: dict[str, np.ndarray] | None = None,
-) -> None:
-    """Store each time-series field as an ``[episode, step]`` array."""
-    output_path = Path(path).expanduser().resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    episode_ids = sorted({int(row["episode"]) for row in rows})
-    steps_per_episode = len(rows) // len(episode_ids)
-    arrays = {
-        key: np.asarray([row[key] for row in rows]).reshape(len(episode_ids), steps_per_episode)
-        for key in rows[0]
-        if key != "episode"
+def _checkpoint_override(model: str) -> str | None:
+    argument_names = {
+        "GCN": "gcn_checkpoint",
+        "EquivGCN": "equivgcn_checkpoint",
+        "EquivGCNMLP": "equiv_gcn_mlp_checkpoint",
+        "FTNet": "ftnet_checkpoint",
+        "FLEX": "flex_checkpoint",
     }
-    if episode_arrays:
-        arrays.update(episode_arrays)
-    np.savez_compressed(output_path, episode=np.asarray(episode_ids), **arrays)
-    print(f"[INFO] Wrote ATE time-series arrays to: {output_path}")
+    return getattr(args_cli, argument_names[model])
 
 
-def _write_plot(path: str, rows: list[dict[str, float]], foot_names: list[str]) -> None:
-    """Write DreamFLEX-style contact/error and FT-Net-style velocity curves."""
+def _latest_baseline_checkpoint(model: str) -> Path:
+    override = _checkpoint_override(model)
+    if override:
+        checkpoint = Path(override).expanduser().resolve()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"{model} checkpoint does not exist: {checkpoint}")
+        return checkpoint
+
+    run_dir = (
+        _repo_root()
+        / "logs"
+        / "rsl_rl"
+        / EXPERIMENTS[model]
+        / args_cli.latest_run_name
+    )
+    checkpoints = list(run_dir.glob("model_*.pt"))
+    if not checkpoints:
+        raise FileNotFoundError(f"No model_*.pt checkpoints found in {run_dir}")
+
+    def iteration(path: Path) -> int:
+        try:
+            return int(path.stem.rsplit("_", 1)[1])
+        except ValueError:
+            return -1
+
+    return max(checkpoints, key=iteration)
+
+
+def _write_csv(path: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        with path.open(newline="", encoding="utf-8") as stream:
+            existing_rows = list(csv.DictReader(stream))
+        merged = {_case_key(row): row for row in existing_rows}
+        for row in rows:
+            merged[_case_key(row)] = row
+        rows = list(merged.values())
+    # Existing evaluation files may predate newly added metrics. Use the union
+    # of all row fields so partial reruns can upgrade the CSV incrementally;
+    # values unavailable in older rows are left blank until those cases rerun.
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames, restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[INFO] Wrote {path}")
+
+
+def _read_csv(path: Path) -> list[dict[str, str]]:
+    """Read an evaluation CSV, returning an empty list when it does not exist."""
+    if not path.is_file():
+        return []
+    with path.open(newline="", encoding="utf-8") as stream:
+        return list(csv.DictReader(stream))
+
+
+def _case_key(row: dict) -> tuple[str, str, str, str, str]:
+    """Return the fields that uniquely identify one evaluation worker case."""
+    return (
+        str(row["model"]),
+        str(row["terrain"]),
+        f"{float(row['fault_coefficient']):g}",
+        str(row.get("fault_joint") or ""),
+        str(row.get("seed", "")),
+    )
+
+
+def _matches_saved_run(row: dict, checkpoint: Path, num_envs: int) -> bool:
+    """Check resume metadata while tolerating older CSVs with missing fields."""
     try:
+        saved_num_envs = int(row.get("num_envs", -1))
+    except (TypeError, ValueError):
+        return False
+    saved_checkpoint = row.get("checkpoint")
+    if not saved_checkpoint:
+        return False
+    return (
+        Path(saved_checkpoint).expanduser().resolve() == checkpoint.resolve()
+        and saved_num_envs == num_envs
+    )
+
+
+def _persist_result(output_dir: Path, protocol: str, row: dict) -> None:
+    """Persist one completed worker immediately so interrupted sweeps can resume."""
+    filename = "rough_locomotion_lifetime.csv" if protocol == "rough" else "flat_ate.csv"
+    _write_csv(output_dir / filename, [row])
+    joint_label = row.get("fault_joint") or "random_joint"
+    _write_csv(
+        output_dir / "by_fault" / joint_label / f"{protocol}_seed_{row['seed']}.csv",
+        [row],
+    )
+
+
+def _worker_command(
+    *,
+    model: str,
+    protocol: str,
+    fault_coef: float,
+    result_json: Path,
+    output_dir: Path,
+    checkpoint: Path,
+    terrain: str | None = None,
+    fault_joint: str | None = None,
+    seed: int = 0,
+) -> list[str]:
+    """Build a worker invocation while retaining launcher/device arguments."""
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *sys.argv[1:],
+        "--worker",
+        "--model",
+        model,
+        "--protocol",
+        protocol,
+        "--fault_coef",
+        str(fault_coef),
+        "--result_json",
+        str(result_json),
+        "--output_dir",
+        str(output_dir),
+        "--task",
+        EVAL_TASKS[model],
+        "--checkpoint",
+        str(checkpoint),
+        "--seed",
+        str(seed),
+    ]
+    if terrain is not None:
+        command.extend(("--terrain", terrain))
+    if fault_joint is not None:
+        command.extend(("--fault_joint", fault_joint))
+    return command
+
+
+def _run_parent() -> int:
+    if args_cli.num_envs <= 0:
+        raise ValueError("--num_envs must be positive.")
+    if args_cli.flex_history_length <= 0:
+        raise ValueError("--flex_history_length must be positive.")
+    if args_cli.rough_duration <= 0.0 or args_cli.flat_duration <= 0.0:
+        raise ValueError("Evaluation durations must be positive.")
+    if args_cli.success_distance is not None and args_cli.success_distance <= 0.0:
+        raise ValueError("--success_distance must be positive when specified.")
+    if args_cli.success_distance_margin < 0.0:
+        raise ValueError("--success_distance_margin must be non-negative.")
+    if args_cli.success_confirmation_time < 0.0:
+        raise ValueError("--success_confirmation_time must be non-negative.")
+    if not 0.0 <= args_cli.fault_time < args_cli.flat_duration:
+        raise ValueError("--fault_time must be within the flat evaluation episode.")
+
+    output_dir = Path(
+        args_cli.output_dir or (_repo_root() / "logs" / "evaluation" / args_cli.latest_run_name)
+    ).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    selected_protocols = ("rough", "flat") if args_cli.protocol == "all" else (args_cli.protocol,)
+    if args_cli.fault_joints is not None and args_cli.fault_joint is not None:
+        raise ValueError("Use either --fault_joint or --fault_joints, not both.")
+    selected_joints = (
+        args_cli.fault_joints
+        if args_cli.fault_joints is not None
+        else [args_cli.fault_joint]
+    )
+    selected_seeds = (
+        args_cli.eval_seeds
+        if args_cli.eval_seeds is not None
+        else [args_cli.seed if args_cli.seed is not None else 0]
+    )
+    results: dict[str, list[dict]] = {"rough": [], "flat": []}
+    saved_rows = {
+        "rough": _read_csv(output_dir / "rough_locomotion_lifetime.csv"),
+        "flat": _read_csv(output_dir / "flat_ate.csv"),
+    }
+
+    with tempfile.TemporaryDirectory(prefix="quadlocofault_eval_") as temp_dir:
+        temp_path = Path(temp_dir)
+        for model in args_cli.models:
+            checkpoint = _latest_baseline_checkpoint(model)
+            print(f"[INFO] {model}: {checkpoint}")
+            for protocol in selected_protocols:
+                terrain_names = (
+                    tuple(args_cli.terrains or TERRAINS)
+                    if protocol == "rough"
+                    else (None,)
+                )
+                for fault_joint in selected_joints:
+                    joint_label = fault_joint or "random_joint"
+                    for seed in selected_seeds:
+                        for terrain in terrain_names:
+                            for fault_coef in FAULT_COEFFICIENTS:
+                                case = {
+                                    "model": model,
+                                    "terrain": terrain or "flat",
+                                    "fault_coefficient": fault_coef,
+                                    "fault_joint": fault_joint,
+                                    "seed": seed,
+                                }
+                                already_saved = any(
+                                    _case_key(row) == _case_key(case)
+                                    and _matches_saved_run(row, checkpoint, args_cli.num_envs)
+                                    for row in saved_rows[protocol]
+                                )
+                                if args_cli.resume_eval and already_saved:
+                                    print(
+                                        "[INFO] Skipping completed "
+                                        f"{model}_{protocol}_{terrain or 'flat'}_"
+                                        f"{joint_label}_seed{seed}_{fault_coef:.1f}"
+                                    )
+                                    continue
+                                label = (
+                                    f"{model}_{protocol}_{terrain or 'flat'}_"
+                                    f"{joint_label}_seed{seed}_{fault_coef:.1f}"
+                                )
+                                result_json = temp_path / f"{label}.json"
+                                print(f"[INFO] Running {label}")
+                                completed = subprocess.run(
+                                    _worker_command(
+                                        model=model,
+                                        protocol=protocol,
+                                        terrain=terrain,
+                                        fault_coef=fault_coef,
+                                        fault_joint=fault_joint,
+                                        seed=seed,
+                                        result_json=result_json,
+                                        output_dir=output_dir,
+                                        checkpoint=checkpoint,
+                                    ),
+                                    check=False,
+                                )
+                                if completed.returncode != 0:
+                                    return completed.returncode
+                                if not result_json.is_file():
+                                    print(
+                                        f"[ERROR] Worker {label} exited without writing {result_json}.",
+                                        file=sys.stderr,
+                                    )
+                                    return 1
+                                row = json.loads(result_json.read_text(encoding="utf-8"))
+                                results[protocol].append(row)
+                                saved_rows[protocol].append(row)
+                                _persist_result(output_dir, protocol, row)
+
+    if results["rough"]:
+        _write_csv(output_dir / "rough_locomotion_lifetime.csv", results["rough"])
+    if results["flat"]:
+        _write_csv(output_dir / "flat_ate.csv", results["flat"])
+    for protocol, protocol_rows in results.items():
+        for fault_joint in selected_joints:
+            for seed in selected_seeds:
+                subset = [
+                    row
+                    for row in protocol_rows
+                    if row.get("fault_joint") == fault_joint and row.get("seed") == seed
+                ]
+                if subset:
+                    joint_label = fault_joint or "random_joint"
+                    _write_csv(
+                        output_dir / "by_fault" / joint_label / f"{protocol}_seed_{seed}.csv",
+                        subset,
+                    )
+    return 0
+
+
+def _run_worker() -> int:
+    if args_cli.model is None or args_cli.fault_coef is None or args_cli.result_json is None:
+        raise ValueError("Worker requires --model, --fault_coef, and --result_json.")
+    if args_cli.protocol == "rough" and args_cli.terrain is None:
+        raise ValueError("A rough worker requires --terrain.")
+
+    sys.argv = [sys.argv[0]] + hydra_args
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
+
+    import importlib.metadata as metadata
+
+    import gymnasium as gym
+    import numpy as np
+    import torch
+    from packaging import version
+    from rsl_rl.runners import DistillationRunner
+    from runners import CustomOnPolicyRunner
+
+    from isaaclab.envs import (
+        DirectMARLEnv,
+        DirectMARLEnvCfg,
+        DirectRLEnvCfg,
+        ManagerBasedRLEnvCfg,
+        multi_agent_to_single_agent,
+    )
+    from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, handle_deprecated_rsl_rl_cfg
+    from isaaclab_tasks.utils.hydra import hydra_task_config
+    from isaaclab_quadlocofault_rl.rsl_rl import CustomRslRlVecEnvWrapper
+
+    import isaaclab_tasks  # noqa: F401
+    import isaaclab_quadlocofault_tasks  # noqa: F401
+
+    installed_version = metadata.version("rsl-rl-lib")
+
+    def configure_common(env_cfg) -> None:
+        env_cfg.scene.num_envs = args_cli.num_envs
+        env_cfg.curriculum.terrain_levels = None
+        env_cfg.curriculum.actuator_faults = None
+        env_cfg.events.add_base_mass = None
+        env_cfg.events.base_external_force_torque = None
+        env_cfg.events.push_robot = None
+        env_cfg.events.reset_actuator_gains.params["motors_strength_range"] = (1.0, 1.0)
+        env_cfg.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
+        env_cfg.events.reset_base.params = {
+            "pose_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
+            "velocity_range": {
+                axis: (0.0, 0.0)
+                for axis in ("x", "y", "z", "roll", "pitch", "yaw")
+            },
+        }
+
+        command = env_cfg.commands.base_velocity
+        command.heading_command = False
+        command.rel_heading_envs = 0.0
+        command.rel_standing_envs = 0.0
+        command.ranges.lin_vel_y = (0.0, 0.0)
+        command.ranges.ang_vel_z = (0.0, 0.0)
+
+        # The event implementation samples severe faults in [0, coef]. Setting
+        # both moderate bounds to coef and severe probability to zero makes the
+        # benchmark coefficient exact rather than random.
+        fault_event = env_cfg.events.randomize_actuator_faults
+        fixed_joint_idx = (
+            JOINT_NAMES.index(args_cli.fault_joint)
+            if args_cli.fault_joint is not None
+            else None
+        )
+        fault_event.params.update(
+            severe_fault_prob=0.0,
+            failure_coef_severe=float(args_cli.fault_coef),
+            failure_coef_moderate=float(args_cli.fault_coef),
+            num_faults=1,
+            fixed_joint_idx=fixed_joint_idx,
+        )
+
+    def configure_rough(env_cfg) -> None:
+        configure_common(env_cfg)
+        env_cfg.episode_length_s = args_cli.rough_duration
+        env_cfg.commands.base_velocity.ranges.lin_vel_x = (0.5, 0.5)
+        env_cfg.commands.base_velocity.resampling_time_range = (
+            args_cli.rough_duration + 1.0,
+            args_cli.rough_duration + 1.0,
+        )
+
+        # fault_event = env_cfg.events.randomize_actuator_faults
+        # fault_event.mode = "reset"
+        # fault_event.interval_range_s = None
+
+        generator = env_cfg.scene.terrain.terrain_generator
+        generator.curriculum = False
+        generator.difficulty_range = (
+            args_cli.terrain_difficulty_min,
+            args_cli.terrain_difficulty_max,
+        )
+        env_cfg.scene.terrain.max_init_terrain_level = None
+        for subterrain in generator.sub_terrains.values():
+            subterrain.proportion = 0.0
+        generator.sub_terrains[TERRAINS[args_cli.terrain]].proportion = 1.0
+
+    def configure_flat(env_cfg) -> None:
+        configure_common(env_cfg)
+        env_cfg.episode_length_s = args_cli.flat_duration
+        env_cfg.commands.base_velocity.ranges.lin_vel_x = (1.0, 1.0)
+        env_cfg.commands.base_velocity.resampling_time_range = (
+            args_cli.flat_duration + 1.0,
+            args_cli.flat_duration + 1.0,
+        )
+        env_cfg.scene.terrain.terrain_type = "plane"
+        env_cfg.scene.terrain.terrain_generator = None
+        env_cfg.scene.terrain.max_init_terrain_level = None
+
+        fault_event = env_cfg.events.randomize_actuator_faults
+        fault_event.mode = "interval"
+        fault_event.interval_range_s = (args_cli.fault_time, args_cli.fault_time)
+
+    def create_runner(env, agent_cfg):
+        if agent_cfg.class_name == "OnPolicyRunner":
+            runner = CustomOnPolicyRunner(
+                env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device
+            )
+        elif agent_cfg.class_name == "DistillationRunner":
+            runner = DistillationRunner(
+                env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device
+            )
+        else:
+            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+        runner.load(args_cli.checkpoint)
+        policy = runner.get_inference_policy(device=env.unwrapped.device)
+        if version.parse(installed_version) >= version.parse("4.0.0"):
+            policy_module = None
+        elif version.parse(installed_version) >= version.parse("2.3.0"):
+            policy_module = runner.alg.policy
+        else:
+            policy_module = runner.alg.actor_critic
+        return runner, policy, policy_module
+
+    def reset_policy(policy, policy_module, dones) -> None:
+        if version.parse(installed_version) >= version.parse("4.0.0"):
+            policy.reset(dones)
+        else:
+            policy_module.reset(dones)
+
+    def evaluate_rough(env, policy, policy_module) -> dict:
+        base_env = env.unwrapped
+        dt = base_env.step_dt
+        max_steps = round(args_cli.rough_duration / dt)
+        terrain_length = float(base_env.cfg.scene.terrain.terrain_generator.size[0])
+        success_distance = args_cli.success_distance
+        if success_distance is None:
+            success_distance = 0.5 * terrain_length - args_cli.success_distance_margin
+        if success_distance <= 0.0:
+            raise ValueError(
+                "The derived success distance must be positive; adjust the terrain size "
+                "or --success_distance_margin."
+            )
+        confirmation_steps = math.ceil(args_cli.success_confirmation_time / dt)
+
+        lifetime = torch.full(
+            (env.num_envs,), max_steps * dt, device=base_env.device
+        )
+        finished = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=base_env.device
+        )
+        reached_target = torch.zeros_like(finished)
+        success = torch.zeros_like(finished)
+        confirmation_count = torch.zeros(
+            env.num_envs, dtype=torch.long, device=base_env.device
+        )
+        robot = base_env.scene["robot"]
+        initial_x = robot.data.root_pos_w[:, 0].clone()
+        max_forward_progress = torch.zeros(
+            env.num_envs, dtype=torch.float, device=base_env.device
+        )
+        total_abs_vx_error = torch.tensor(0.0, device=base_env.device)
+        total_abs_xy_error = torch.tensor(0.0, device=base_env.device)
+        total_ate_samples = 0
+        obs = env.get_observations()
+        with torch.inference_mode():
+            for step in range(max_steps):
+                # Save first-episode progress before env.step(), since Isaac Lab
+                # automatically resets terminated environments inside that call.
+                active_before_step = ~finished
+                forward_progress = robot.data.root_pos_w[:, 0] - initial_x
+                max_forward_progress[active_before_step] = torch.maximum(
+                    max_forward_progress[active_before_step],
+                    forward_progress[active_before_step],
+                )
+
+                outputs = policy(obs)
+                actions = outputs[0] if isinstance(outputs, tuple) else outputs
+                obs, _, dones, _ = env.step(actions)
+                dones = dones.bool()
+                # A time-out at the requested horizon is censoring, not a
+                # locomotion failure. Only physical termination ends lifetime.
+                terminated = base_env.reset_terminated.bool()
+
+                # Isaac Lab resets terminated environments during env.step().
+                # Exclude those reset observations from first-episode ATE.
+                valid_ate = active_before_step & ~terminated
+                if valid_ate.any():
+                    command = base_env.command_manager.get_command("base_velocity")
+                    measured_xy = base_env.scene["robot"].data.root_lin_vel_b[:, :2]
+                    velocity_error = command[:, :2] - measured_xy
+                    total_abs_vx_error += torch.abs(velocity_error[valid_ate, 0]).sum()
+                    total_abs_xy_error += torch.linalg.vector_norm(
+                        velocity_error[valid_ate], dim=1
+                    ).sum()
+                    total_ate_samples += int(valid_ate.sum().item())
+
+                # Reaching the target on a step that ends in termination does
+                # not count. A successful traversal must then remain alive for
+                # the requested confirmation window, preventing a fall or
+                # forward tumble from being classified as success.
+                valid_first_episode = active_before_step & ~terminated
+                reached_target |= (
+                    valid_first_episode & (forward_progress >= success_distance)
+                )
+                confirming = valid_first_episode & reached_target & ~success
+                confirmation_count[confirming] += 1
+                success |= confirming & (confirmation_count >= confirmation_steps)
+
+                newly_finished = terminated & ~finished
+                lifetime[newly_finished] = (step + 1) * dt
+                finished |= newly_finished
+                reset_policy(policy, policy_module, dones)
+                if finished.all():
+                    break
+
+        return {
+            "model": args_cli.model,
+            "terrain": args_cli.terrain,
+            "terrain_cfg": TERRAINS[args_cli.terrain],
+            "fault_coefficient": float(args_cli.fault_coef),
+            "fault_joint": args_cli.fault_joint,
+            "seed": int(args_cli.seed),
+            "fault_time_s": 0.0,
+            "command_vx_mps": 0.5,
+            "num_envs": env.num_envs,
+            "horizon_s": max_steps * dt,
+            "success_distance_m": float(success_distance),
+            "success_confirmation_time_s": float(args_cli.success_confirmation_time),
+            "distance_success_rate": float(success.float().mean().item()),
+            "num_distance_successes": int(success.sum().item()),
+            "mean_max_forward_progress_m": float(max_forward_progress.mean().item()),
+            "median_max_forward_progress_m": float(max_forward_progress.median().item()),
+            "ate_vx_mps": float(
+                (total_abs_vx_error / max(total_ate_samples, 1)).item()
+            ),
+            "ate_xy_mps": float(
+                (total_abs_xy_error / max(total_ate_samples, 1)).item()
+            ),
+            "num_ate_samples": total_ate_samples,
+            "mean_locomotion_time_s": float(lifetime.mean().item()),
+            "std_locomotion_time_s": float(lifetime.std(unbiased=False).item()),
+            "median_locomotion_time_s": float(lifetime.median().item()),
+            "min_locomotion_time_s": float(lifetime.min().item()),
+            "survival_to_horizon": float((~finished).float().mean().item()),
+            "num_resets_before_horizon": int(finished.sum().item()),
+            "checkpoint": str(Path(args_cli.checkpoint).resolve()),
+        }
+
+    def write_contact_plot(
+        times: list[float],
+        contacts: list[list[float]],
+        foot_names: list[str],
+    ) -> Path:
         import matplotlib
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-    except ImportError:
-        print("[WARN] matplotlib is unavailable; skipping the evaluation plot.")
-        return
 
-    time_s = [row["time_s"] for row in rows]
-    fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True, constrained_layout=True)
-    for offset, name in enumerate(foot_names):
-        axes[0].step(
-            time_s,
-            [row[f"env_contact_{name}"] + offset for row in rows],
-            where="post",
-            label=name,
+        figure, axis = plt.subplots(figsize=(10, 3.8), constrained_layout=True)
+        contact_array = np.asarray(contacts).T
+        for foot_index, foot_name in enumerate(foot_names):
+            axis.step(
+                times,
+                contact_array[foot_index] + foot_index,
+                where="post",
+                label=foot_name,
+            )
+        axis.axvline(args_cli.fault_time, color="red", linestyle="--", label="fault")
+        axis.set_yticks(range(len(foot_names)), foot_names)
+        axis.set_xlabel("Time (s)")
+        axis.set_ylabel("Foot contact")
+        axis.set_title(
+            f"{args_cli.model}, fault coefficient={args_cli.fault_coef:.1f}, "
+            f"environment={args_cli.plot_env_id}"
         )
-    axes[0].set_yticks(range(len(foot_names)), foot_names)
-    axes[0].set_ylabel("Foot contact")
-    axes[0].set_title(f"Foot contact — environment {args_cli.plot_env_id}")
-    axes[0].grid(alpha=0.25)
-
-    axes[1].plot(time_s, [row["env_cmd_vx_mps"] for row in rows], "--", label="command vx")
-    axes[1].plot(time_s, [row["env_measured_vx_mps"] for row in rows], label="measured vx")
-    axes[1].set_ylabel("Velocity (m/s)")
-    axes[1].set_title("Velocity tracking curve (FT-Net-style)")
-    axes[1].legend()
-    axes[1].grid(alpha=0.25)
-
-    axes[1].set_xlabel("Time (s)")
-
-    output_path = Path(path).expanduser().resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=160)
-    plt.close(fig)
-    print(f"[INFO] Wrote evaluation plot to: {output_path}")
-
-
-@hydra_task_config(args_cli.task, args_cli.agent)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    """Load a checkpoint, play it for a finite duration, and save ATE."""
-    if (
-        args_cli.duration <= 0.0
-        or args_cli.warmup < 0.0
-        or args_cli.num_episodes <= 0
-        or not 0.0 <= args_cli.distance_failure_ratio <= 1.0
-    ):
-        raise ValueError(
-            "--duration and --num_episodes must be positive, --warmup must be non-negative, "
-            "and --distance_failure_ratio must be in [0, 1]."
+        axis.set_xlim(0.0, args_cli.flat_duration)
+        axis.grid(alpha=0.25)
+        axis.legend(loc="upper right")
+        output_dir = Path(args_cli.output_dir).expanduser().resolve() / "contact_plots"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / (
+            f"{args_cli.model.lower()}_{args_cli.fault_joint or 'random_joint'}_"
+            f"seed_{args_cli.seed}_fault_{args_cli.fault_coef:.1f}_contacts.png"
         )
+        figure.savefig(output_path, dpi=180)
+        plt.close(figure)
+        return output_path
 
-    task_name = args_cli.task.split(":")[-1]
-    train_task_name = task_name.replace("-Play", "")
-    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
-    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
-    env_cfg.scene.num_envs = args_cli.num_envs
-    env_cfg.seed = agent_cfg.seed
-    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    _set_fixed_velocity_command(env_cfg)
+    def evaluate_flat(env, policy, policy_module) -> dict:
+        if not 0 <= args_cli.plot_env_id < env.num_envs:
+            raise ValueError(f"--plot_env_id must be in [0, {env.num_envs - 1}].")
 
-    log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
-    if args_cli.use_pretrained_checkpoint:
-        resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
-        if not resume_path:
-            raise RuntimeError("A published checkpoint is unavailable for this task.")
-    elif args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
-    else:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-    log_dir = os.path.dirname(resume_path)
-    env_cfg.log_dir = log_dir
-    print(f"[INFO] Loading model checkpoint from: {resume_path}")
+        base_env = env.unwrapped
+        dt = base_env.step_dt
+        max_steps = round(args_cli.flat_duration / dt)
+        fault_step = round(args_cli.fault_time / dt)
+        sensor = base_env.scene.sensors["contact_forces"]
+        foot_ids, foot_names = sensor.find_bodies(".*_foot", preserve_order=True)
+        alive = torch.ones(env.num_envs, dtype=torch.bool, device=base_env.device)
+        total_abs_vx_error = torch.tensor(0.0, device=base_env.device)
+        post_abs_vx_error = torch.tensor(0.0, device=base_env.device)
+        total_abs_xy_error = torch.tensor(0.0, device=base_env.device)
+        total_samples = 0
+        post_samples = 0
+        times: list[float] = []
+        contact_history: list[list[float]] = []
+        plot_env_alive = True
+        obs = env.get_observations()
 
-    render_mode = "rgb_array" if args_cli.video else None
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode=render_mode)
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
-
-    dt = env.unwrapped.step_dt
-    warmup_steps = round(args_cli.warmup / dt)
-    eval_steps = round(args_cli.duration / dt)
-    if args_cli.plot_env_id < 0 or args_cli.plot_env_id >= env.unwrapped.num_envs:
-        raise ValueError(f"--plot_env_id must be in [0, {env.unwrapped.num_envs - 1}].")
-    if args_cli.video:
-        video_length = args_cli.video_length or warmup_steps + eval_steps
-        video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "eval"),
-            "step_trigger": lambda step: step == 0,
-            "video_length": video_length,
-            "disable_logger": True,
-        }
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
-    env = CustomRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = CustomOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
-    policy_nn = None
-    if version.parse(installed_version) < version.parse("4.0.0"):
-        policy_nn = runner.alg.policy if version.parse(installed_version) >= version.parse("2.3.0") else runner.alg.actor_critic
-
-    obs = env.get_observations()
-    sum_abs_error = torch.zeros(3, device=env.unwrapped.device)
-    sum_xy_norm_error = torch.tensor(0.0, device=env.unwrapped.device)
-    per_env_x_error = torch.zeros(env.num_envs, device=env.unwrapped.device)
-    base_env = env.unwrapped
-    contact_sensor = base_env.scene[args_cli.contact_sensor_name]
-    foot_ids, foot_names = contact_sensor.find_bodies(args_cli.foot_body_regex, preserve_order=True)
-    if not foot_ids:
-        raise RuntimeError(
-            f"Foot regex {args_cli.foot_body_regex!r} matched no bodies in sensor "
-            f"{args_cli.contact_sensor_name!r}."
-        )
-    contact_counts = torch.zeros(len(foot_ids), device=env.unwrapped.device)
-    rows: list[dict[str, float]] = []
-    episode_ates: list[float] = []
-    episode_traveled_distances: list[np.ndarray] = []
-    episode_expected_distances: list[np.ndarray] = []
-    episode_reset_flags: list[np.ndarray] = []
-    episode_failure_flags: list[np.ndarray] = []
-
-    with torch.inference_mode():
-        for episode in range(args_cli.num_episodes):
-            if episode > 0:
-                env.reset()
-                obs = env.get_observations()
-                reset_dones = torch.ones(env.num_envs, dtype=torch.bool, device=env.unwrapped.device)
-                if version.parse(installed_version) >= version.parse("4.0.0"):
-                    policy.reset(reset_dones)
-                else:
-                    policy_nn.reset(reset_dones)
-
-            episode_x_error = 0.0
-            traveled_distance = torch.zeros(env.num_envs, device=env.unwrapped.device)
-            expected_distance = torch.zeros(env.num_envs, device=env.unwrapped.device)
-            reset_during_measurement = torch.zeros(env.num_envs, dtype=torch.bool, device=env.unwrapped.device)
-            asset = base_env.scene[args_cli.asset_name]
-            previous_xy = asset.data.root_pos_w[:, :2].clone()
-            for step in range(warmup_steps + eval_steps):
-                start_time = time.time()
+        with torch.inference_mode():
+            for step in range(max_steps):
                 outputs = policy(obs)
                 actions = outputs[0] if isinstance(outputs, tuple) else outputs
                 obs, _, dones, _ = env.step(actions)
-                if version.parse(installed_version) >= version.parse("4.0.0"):
-                    policy.reset(dones)
-                else:
-                    policy_nn.reset(dones)
+                dones = dones.bool()
+                terminated = base_env.reset_terminated.bool()
 
-                current_xy = asset.data.root_pos_w[:, :2].clone()
-                if step >= warmup_steps:
-                    command = base_env.command_manager.get_command(args_cli.command_name)
-                    measured = torch.cat((asset.data.root_lin_vel_b[:, :2], asset.data.root_ang_vel_b[:, 2:3]), dim=1)
-                    abs_error = torch.abs(command[:, :3] - measured)
-                    reset_mask = dones.bool()
-                    traveled_distance += torch.linalg.vector_norm(current_xy - previous_xy, dim=1) * (~reset_mask)
-                    expected_distance += torch.linalg.vector_norm(command[:, :2], dim=1) * dt
-                    reset_during_measurement |= reset_mask
-                    foot_forces = torch.linalg.vector_norm(
-                        contact_sensor.data.net_forces_w[:, foot_ids, :], dim=-1
+                command = base_env.command_manager.get_command("base_velocity")
+                measured_xy = base_env.scene["robot"].data.root_lin_vel_b[:, :2]
+                abs_vx_error = torch.abs(command[:, 0] - measured_xy[:, 0])
+                abs_xy_error = torch.linalg.vector_norm(
+                    command[:, :2] - measured_xy, dim=1
+                )
+                if alive.any():
+                    total_abs_vx_error += abs_vx_error[alive].sum()
+                    total_abs_xy_error += abs_xy_error[alive].sum()
+                    sample_count = int(alive.sum().item())
+                    total_samples += sample_count
+                    if step >= fault_step:
+                        post_abs_vx_error += abs_vx_error[alive].sum()
+                        post_samples += sample_count
+
+                foot_forces = torch.linalg.vector_norm(
+                    sensor.data.net_forces_w[:, foot_ids, :], dim=-1
+                )
+                contacts = foot_forces > args_cli.contact_threshold
+                times.append((step + 1) * dt)
+                if plot_env_alive:
+                    contact_history.append(
+                        contacts[args_cli.plot_env_id].float().cpu().tolist()
                     )
-                    foot_contacts = foot_forces > args_cli.contact_threshold
-                    step_x_error = float(abs_error[:, 0].mean().item())
-                    episode_x_error += step_x_error
-                    sum_abs_error += abs_error.mean(dim=0)
-                    sum_xy_norm_error += torch.linalg.vector_norm(command[:, :2] - measured[:, :2], dim=1).mean()
-                    per_env_x_error += abs_error[:, 0]
-                    contact_counts += foot_contacts.float().mean(dim=0)
-                    row = {
-                        "episode": episode,
-                        "time_s": (step - warmup_steps + 1) * dt,
-                        "ate_x_mps": step_x_error,
-                        "abs_y_error_mps": float(abs_error[:, 1].mean().item()),
-                        "abs_yaw_error_radps": float(abs_error[:, 2].mean().item()),
-                        "mean_cmd_vx_mps": float(command[:, 0].mean().item()),
-                        "mean_measured_vx_mps": float(measured[:, 0].mean().item()),
-                        "env_cmd_vx_mps": float(command[args_cli.plot_env_id, 0].item()),
-                        "env_measured_vx_mps": float(measured[args_cli.plot_env_id, 0].item()),
-                    }
-                    for foot_index, foot_name in enumerate(foot_names):
-                        row[f"env_contact_force_{foot_name}_N"] = float(
-                            foot_forces[args_cli.plot_env_id, foot_index].item()
-                        )
-                        row[f"env_contact_{foot_name}"] = int(
-                            foot_contacts[args_cli.plot_env_id, foot_index].item()
-                        )
-                    rows.append(row)
+                else:
+                    contact_history.append([float("nan")] * len(foot_names))
+                plot_env_alive &= not bool(terminated[args_cli.plot_env_id].item())
 
-                previous_xy = current_xy
-                sleep_time = dt - (time.time() - start_time)
-                if args_cli.real_time and sleep_time > 0.0:
-                    time.sleep(sleep_time)
+                alive &= ~terminated
+                reset_policy(policy, policy_module, dones)
 
-            episode_ates.append(episode_x_error / eval_steps)
-            distance_failure = traveled_distance < args_cli.distance_failure_ratio * expected_distance
-            failure = reset_during_measurement | distance_failure
-            episode_traveled_distances.append(traveled_distance.cpu().numpy())
-            episode_expected_distances.append(expected_distance.cpu().numpy())
-            episode_reset_flags.append(reset_during_measurement.cpu().numpy())
-            episode_failure_flags.append(failure.cpu().numpy())
-            print(f"[INFO] Completed episode {episode + 1}/{args_cli.num_episodes}")
+        plot_path = write_contact_plot(times, contact_history, foot_names)
+        return {
+            "model": args_cli.model,
+            "terrain": "flat",
+            "fault_coefficient": float(args_cli.fault_coef),
+            "fault_joint": args_cli.fault_joint,
+            "seed": int(args_cli.seed),
+            "fault_time_s": args_cli.fault_time,
+            "command_vx_mps": 1.0,
+            "num_envs": env.num_envs,
+            "episode_length_s": max_steps * dt,
+            "ate_vx_mps": float((total_abs_vx_error / max(total_samples, 1)).item()),
+            "post_fault_ate_vx_mps": float(
+                (post_abs_vx_error / max(post_samples, 1)).item()
+            ),
+            "ate_xy_mps": float((total_abs_xy_error / max(total_samples, 1)).item()),
+            "survival_to_10s": float(alive.float().mean().item()),
+            "num_resets_before_10s": int((~alive).sum().item()),
+            "contact_plot": str(plot_path),
+            "checkpoint": str(Path(args_cli.checkpoint).resolve()),
+        }
 
-    total_eval_steps = eval_steps * args_cli.num_episodes
-    mean_abs_error = sum_abs_error / total_eval_steps
-    traveled_distance_array = np.stack(episode_traveled_distances)
-    expected_distance_array = np.stack(episode_expected_distances)
-    reset_flag_array = np.stack(episode_reset_flags)
-    failure_flag_array = np.stack(episode_failure_flags)
-    metrics = {
-        "definition": "mean_t,env(abs(commanded_body_vx - measured_body_vx))",
-        "ate_mps": float(mean_abs_error[0].item()),
-        "abs_lateral_error_mps": float(mean_abs_error[1].item()),
-        "abs_xy_vector_error_mps": float((sum_xy_norm_error / total_eval_steps).item()),
-        "abs_yaw_rate_error_radps": float(mean_abs_error[2].item()),
-        "per_env_ate_mps": (per_env_x_error / total_eval_steps).cpu().tolist(),
-        "per_episode_ate_mps": episode_ates,
-        "locomotion_failure_definition": (
-            "reset during measurement OR traveled_distance < "
-            f"{args_cli.distance_failure_ratio:.3f} * commanded_distance"
-        ),
-        "locomotion_failure_rate": float(failure_flag_array.mean()),
-        "num_locomotion_failures": int(failure_flag_array.sum()),
-        "num_episode_env_trials": int(failure_flag_array.size),
-        "distance_failure_ratio": args_cli.distance_failure_ratio,
-        "foot_names": foot_names,
-        "contact_threshold_N": args_cli.contact_threshold,
-        "mean_foot_contact_ratio": {
-            name: float((contact_counts[index] / total_eval_steps).item()) for index, name in enumerate(foot_names)
-        },
-        "command": {"vx_mps": args_cli.command_x, "vy_mps": args_cli.command_y, "yaw_rate_radps": args_cli.command_yaw},
-        "duration_s": eval_steps * dt,
-        "warmup_s": warmup_steps * dt,
-        "step_dt_s": dt,
-        "num_envs": env.num_envs,
-        "num_episodes": args_cli.num_episodes,
-        "num_samples": total_eval_steps * env.num_envs,
-        "task": args_cli.task,
-        "checkpoint": os.path.abspath(resume_path),
-    }
-    metrics_path = Path(args_cli.metrics_path or os.path.join(log_dir, "eval", "ate.json")).expanduser().resolve()
-    metrics_path.parent.mkdir(parents=True, exist_ok=True)
-    metrics_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
-    timeseries_path = args_cli.timeseries_npz or os.path.join(log_dir, "eval", "timeseries.npz")
-    plot_path = args_cli.plot_path or os.path.join(log_dir, "eval", "tracking.png")
-    _write_npz(
-        timeseries_path,
-        rows,
-        episode_arrays={
-            "traveled_distance_m": traveled_distance_array,
-            "expected_distance_m": expected_distance_array,
-            "reset_during_measurement": reset_flag_array,
-            "locomotion_failure": failure_flag_array,
-        },
-    )
-    if args_cli.num_episodes == 1:
-        _write_plot(plot_path, rows, foot_names)
+    @hydra_task_config(args_cli.task, args_cli.agent)
+    def main(
+        env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+        agent_cfg: RslRlBaseRunnerCfg,
+    ):
+        agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+        agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
+        # Benchmark tasks share all physical environment settings, but each
+        # architecture must retain the history horizon it was trained with.
+        # DreamFLEX uses N=5; FTNet and the other history-based models use the
+        # common 30-frame history.
+        if args_cli.model == "FLEX":
+            env_cfg.observations.history.history_length = args_cli.flex_history_length
+        env_cfg.seed = agent_cfg.seed
+        env_cfg.sim.device = (
+            args_cli.device if args_cli.device is not None else env_cfg.sim.device
+        )
+        if args_cli.protocol == "rough":
+            configure_rough(env_cfg)
+        elif args_cli.protocol == "flat":
+            configure_flat(env_cfg)
+        else:
+            raise ValueError("Worker protocol must be rough or flat.")
 
-    print("\n[RESULT] DreamFLEX forward-velocity ATE")
-    print(f"  Average ATE: {metrics['ate_mps']:.6f} m/s")
-    if args_cli.num_episodes > 1:
-        print(f"  Failure rate: {metrics['locomotion_failure_rate']:.2%}")
-    print(
-        f"  samples:     {metrics['num_samples']} "
-        f"({args_cli.num_episodes} episodes x {env.num_envs} envs x {eval_steps} steps)"
-    )
-    print(f"  metrics:   {metrics_path}")
-    print(f"  time series: {Path(timeseries_path).expanduser().resolve()}")
-    if args_cli.num_episodes == 1:
-        print(f"  plot:        {Path(plot_path).expanduser().resolve()}")
-    env.close()
+        env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
+        if isinstance(env.unwrapped, DirectMARLEnv):
+            env = multi_agent_to_single_agent(env)
+        env = CustomRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+        runner, policy, policy_module = create_runner(env, agent_cfg)
+        try:
+            if args_cli.protocol == "rough":
+                result = evaluate_rough(env, policy, policy_module)
+            else:
+                result = evaluate_flat(env, policy, policy_module)
+            result_path = Path(args_cli.result_json).expanduser().resolve()
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            result_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps(result, indent=2))
+        finally:
+            env.close()
 
-
-if __name__ == "__main__":
     try:
         main()
     finally:
         simulation_app.close()
+    return 0
+
+
+if __name__ == "__main__":
+    if args_cli.worker:
+        raise SystemExit(_run_worker())
+    raise SystemExit(_run_parent())

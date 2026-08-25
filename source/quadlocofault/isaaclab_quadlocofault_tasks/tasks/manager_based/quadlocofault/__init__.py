@@ -3,286 +3,115 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+"""Gym registrations for Unitree Go2 fault-tolerant locomotion."""
+
 import gymnasium as gym
 
 from . import agents
 
-##
-# Register Gym environments.
-##
 
-### Base envs
-gym.register(
-    id="Base-Isaac-Velocity-Flat-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeGo2FlatEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2FlatPPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+_ENTRY_POINT = "isaaclab.envs:ManagerBasedRLEnv"
+_AGENT_MODULE = f"{agents.__name__}.rsl_rl_ppo_cfg"
+
+
+def _register(task_id: str, env_cfg: str, runner_cfg: str, terrain: str) -> None:
+    """Register one task with the common environment and agent metadata."""
+    gym.register(
+        id=task_id,
+        entry_point=_ENTRY_POINT,
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.{terrain}_env_cfg:{env_cfg}",
+            "rsl_rl_cfg_entry_point": f"{_AGENT_MODULE}:{runner_cfg}",
+            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_{terrain}_ppo_cfg.yaml",
+        },
+    )
+
+
+# Existing training/play IDs remain unchanged for checkpoint compatibility.
+_POLICIES = {
+    "Base": {
+        "rough_env": "UnitreeGo2RoughEnvCfg",
+        "flat_env": "UnitreeGo2FlatEnvCfg",
+        "rough_runner": "UnitreeGo2RoughPPORunnerCfg",
+        "flat_runner": "UnitreeGo2FlatPPORunnerCfg",
     },
-)
-
-gym.register(
-    id="Base-Isaac-Velocity-Flat-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeGo2FlatEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2FlatPPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+    "FTNet": {
+        "rough_env": "UnitreeGo2RoughFTNetEnvCfg",
+        "flat_env": "UnitreeGo2FlatFTNetEnvCfg",
+        "rough_runner": "UnitreeGo2RoughPPOFTNetRunnerCfg",
+        "flat_runner": "UnitreeGo2FlatPPOFTNetRunnerCfg",
     },
-)
-
-gym.register(
-    id="Base-Isaac-Velocity-Rough-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+    "FLEX": {
+        "rough_env": "UnitreeGo2RoughFLEXEnvCfg",
+        "flat_env": "UnitreeGo2FlatFLEXEnvCfg",
+        "rough_runner": "UnitreeGo2RoughPPOFLEXRunnerCfg",
+        "flat_runner": "UnitreeGo2FlatPPOFLEXRunnerCfg",
     },
-)
-
-gym.register(
-    id="Base-Isaac-Velocity-Rough-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+    "PINN": {
+        "rough_env": "UnitreeGo2RoughPINNEnvCfg",
+        "flat_env": "UnitreeGo2FlatPINNEnvCfg",
+        "rough_runner": "UnitreeGo2RoughPPOPINNRunnerCfg",
+        "flat_runner": "UnitreeGo2FlatPPOPINNRunnerCfg",
     },
-)
-
-gym.register(
-    id="Oracle-Isaac-Velocity-Rough-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughOracleEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughOraclePPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+    "GCN": {
+        "rough_env": "UnitreeGo2RoughGCNEnvCfg",
+        "flat_env": "UnitreeGo2FlatGCNEnvCfg",
+        "rough_runner": "UnitreeGo2RoughPPOGCNRunnerCfg",
+        "flat_runner": "UnitreeGo2FlatPPOGCNRunnerCfg",
     },
-)
+}
 
-gym.register(
-    id="Oracle-Isaac-Velocity-Rough-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughOracleEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughOraclePPORunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
-
-
-### FTNet envs
-gym.register(
-    id="FTNet-Isaac-Velocity-Flat-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeGo2FlatFTNetEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2FlatPPOFTNetRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="FTNet-Isaac-Velocity-Flat-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeGo2FlatFTNetEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2FlatPPOFTNetRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="FTNet-Isaac-Velocity-Rough-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughFTNetEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPOFTNetRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="FTNet-Isaac-Velocity-Rough-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughFTNetEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPOFTNetRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
-
-### FLEX envs
-gym.register(
-    id="FLEX-Isaac-Velocity-Flat-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeGo2FlatFLEXEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2FlatPPOFLEXRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="FLEX-Isaac-Velocity-Flat-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeGo2FlatFLEXEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2FlatPPOFLEXRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="FLEX-Isaac-Velocity-Rough-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughFLEXEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPOFLEXRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="FLEX-Isaac-Velocity-Rough-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughFLEXEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPOFLEXRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
+for policy_name, cfg in _POLICIES.items():
+    for terrain_name in ("flat", "rough"):
+        # Every policy has train and play variants with the same runner.
+        for play_suffix, env_suffix in (("", ""), ("-Play", "_PLAY")):
+            _register(
+                task_id=f"{policy_name}-Isaac-Velocity-{terrain_name.title()}-Unitree-Go2{play_suffix}-v0",
+                env_cfg=f"{cfg[f'{terrain_name}_env']}{env_suffix}",
+                runner_cfg=cfg[f"{terrain_name}_runner"],
+                terrain=terrain_name,
+            )
 
 
-### PINN envs
-gym.register(
-    id="PINN-Isaac-Velocity-Flat-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeGo2FlatPINNEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2FlatPPOPINNRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
-    },
-)
+for play_suffix, env_suffix in (("", ""), ("-Play", "_PLAY")):
+    _register(
+        task_id=f"Oracle-Isaac-Velocity-Rough-Unitree-Go2{play_suffix}-v0",
+        env_cfg=f"UnitreeGo2RoughOracleEnvCfg{env_suffix}",
+        runner_cfg="UnitreeGo2RoughOraclePPORunnerCfg",
+        terrain="rough",
+    )
+    _register(
+        task_id=f"EquivGCN-Isaac-Velocity-Rough-Unitree-Go2{play_suffix}-v0",
+        env_cfg=f"UnitreeGo2RoughEquivGCNEnvCfg{env_suffix}",
+        runner_cfg="UnitreeGo2RoughPPOEquivGCNRunnerCfg",
+        terrain="rough",
+    )
+    _register(
+        task_id=f"EquivGCNMLP-Isaac-Velocity-Rough-Unitree-Go2{play_suffix}-v0",
+        env_cfg=f"UnitreeGo2RoughEquivGCNEnvCfg{env_suffix}",
+        runner_cfg="UnitreeGo2RoughPPOEquivGCNMLPRunnerCfg",
+        terrain="rough",
+    )
 
-gym.register(
-    id="PINN-Isaac-Velocity-Flat-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeGo2FlatPINNEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2FlatPPOPINNRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
-    },
-)
 
-gym.register(
-    id="PINN-Isaac-Velocity-Rough-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughPINNEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPOPINNRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="PINN-Isaac-Velocity-Rough-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughPINNEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPOPINNRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
-
-### GCN envs
-gym.register(
-    id="GCN-Isaac-Velocity-Flat-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeGo2FlatGCNEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2FlatPPOGCNRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="GCN-Isaac-Velocity-Flat-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:UnitreeGo2FlatGCNEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2FlatPPOGCNRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="GCN-Isaac-Velocity-Rough-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughGCNEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPOGCNRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="GCN-Isaac-Velocity-Rough-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughGCNEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPOGCNRunnerCfg",
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
-
-### EquivGCN envs
-gym.register(
-    id="EquivGCN-Isaac-Velocity-Rough-Unitree-Go2-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughEquivGCNEnvCfg",
-        "rsl_rl_cfg_entry_point": (
-            f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPOEquivGCNRunnerCfg"
-        ),
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
-
-gym.register(
-    id="EquivGCN-Isaac-Velocity-Rough-Unitree-Go2-Play-v0",
-    entry_point="isaaclab_quadlocofault:CustomManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.rough_env_cfg:UnitreeGo2RoughEquivGCNEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": (
-            f"{agents.__name__}.rsl_rl_ppo_cfg:UnitreeGo2RoughPPOEquivGCNRunnerCfg"
-        ),
-        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-    },
-)
+# Benchmark IDs share the same physical configuration. FTNet retains its
+# paper-specific 49-D proprioception and separate privileged-physics group;
+# all other architectures use the common observation configuration.
+_EVAL_RUNNERS = {
+    "GCN": "UnitreeGo2RoughPPOGCNRunnerCfg",
+    "EquivGCN": "UnitreeGo2RoughPPOEquivGCNRunnerCfg",
+    "EquivGCNMLP": "UnitreeGo2RoughPPOEquivGCNMLPRunnerCfg",
+    "FTNet": "UnitreeGo2RoughPPOFTNetRunnerCfg",
+    "FLEX": "UnitreeGo2RoughPPOFLEXRunnerCfg",
+}
+_EVAL_ENVS = {
+    "FTNet": "UnitreeGo2EvaluationFTNetEnvCfg",
+}
+for policy_name, runner_cfg in _EVAL_RUNNERS.items():
+    _register(
+        task_id=f"{policy_name}-Isaac-Velocity-Eval-Unitree-Go2-v0",
+        env_cfg=_EVAL_ENVS.get(policy_name, "UnitreeGo2EvaluationEnvCfg"),
+        runner_cfg=runner_cfg,
+        terrain="rough",
+    )

@@ -8,13 +8,22 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import csv
 import sys
+from collections import deque
 
 from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
 import math
+
+FAULT_JOINT_NAMES = (
+    "FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint",
+    "FL_thigh_joint", "FR_thigh_joint", "RL_thigh_joint", "RR_thigh_joint",
+    "FL_calf_joint", "FR_calf_joint", "RL_calf_joint", "RR_calf_joint",
+)
+
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
@@ -24,6 +33,18 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument(
+    "--terrain_type",
+    type=str,
+    default=None,
+    help="Use only the named terrain from the environment's configured terrain mix.",
+)
+parser.add_argument(
+    "--fault_joint",
+    choices=FAULT_JOINT_NAMES,
+    default=None,
+    help="Apply the play-mode actuator fault to this fixed joint instead of sampling one randomly.",
+)
 parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
@@ -74,10 +95,67 @@ parser.add_argument(
     help="Output path for the fused-latent t-SNE PDF.",
 )
 parser.add_argument(
+    "--latent_npz_output",
+    type=str,
+    default=None,
+    help=(
+        "Output path for the fused-latent NPZ data. When omitted, the t-SNE "
+        "output path is used with an .npz suffix."
+    ),
+)
+parser.add_argument(
     "--latent_tsne_perplexity",
     type=float,
     default=30.0,
     help="Perplexity used by t-SNE.",
+)
+parser.add_argument(
+    "--export",
+    choices=("jit", "onnx", "both"),
+    default=None,
+    help="Export the loaded deterministic policy next to its checkpoint.",
+)
+parser.add_argument(
+    "--export_only",
+    action="store_true",
+    default=False,
+    help="Exit after exporting; requires --export.",
+)
+parser.add_argument(
+    "--log_fault_motion",
+    action="store_true",
+    default=False,
+    help="Log faulted-leg thigh/calf targets and measured motion to CSV.",
+)
+parser.add_argument(
+    "--fault_motion_output",
+    type=str,
+    default=None,
+    help="Fault-motion CSV path; defaults beside the loaded checkpoint.",
+)
+parser.add_argument(
+    "--fault_motion_env",
+    type=int,
+    default=0,
+    help="Environment index used for fault-motion diagnostics.",
+)
+parser.add_argument(
+    "--fault_motion_print_interval",
+    type=int,
+    default=100,
+    help="Print online motion-source statistics every N logged samples.",
+)
+parser.add_argument(
+    "--fault_motion_window",
+    type=int,
+    default=200,
+    help="Rolling sample window used for online motion-source statistics.",
+)
+parser.add_argument(
+    "--fault_motion_steps",
+    type=int,
+    default=0,
+    help="Stop after this many simulation steps when logging; zero runs indefinitely.",
 )
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -122,6 +200,8 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
+from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers.config import RAY_CASTER_MARKER_CFG
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
@@ -207,6 +287,225 @@ def print_fault_predictions(
         print(f"[FAULT TCN] env={env_id}: {prediction}")
 
 
+class FaultMotionLogger:
+    """Record commanded and measured thigh/calf motion on one faulted leg."""
+
+    JOINT_TYPES = ("thigh", "calf")
+
+    def __init__(
+        self,
+        base_env,
+        env_id: int,
+        output_path: str,
+        dt: float,
+        print_interval: int,
+        window_size: int,
+    ) -> None:
+        if not 0 <= env_id < base_env.num_envs:
+            raise ValueError(
+                f"--fault_motion_env must be in [0, {base_env.num_envs - 1}], got {env_id}."
+            )
+        if print_interval <= 0:
+            raise ValueError("--fault_motion_print_interval must be positive.")
+        if window_size < 2:
+            raise ValueError("--fault_motion_window must be at least 2.")
+
+        self.asset = base_env.scene["robot"]
+        self.action_term = base_env.action_manager.get_term("joint_pos")
+        self.env_id = env_id
+        self.dt = dt
+        self.print_interval = print_interval
+        self.window_size = window_size
+        self.asset_joint_id = {
+            name: joint_id for joint_id, name in enumerate(self.asset.joint_names)
+        }
+        self.action_joint_id = {
+            name: joint_id
+            for joint_id, name in enumerate(self.action_term._joint_names)
+        }
+
+        output_path = os.path.abspath(os.path.expanduser(output_path))
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        self.output_path = output_path
+        self.file = open(output_path, "w", newline="", encoding="utf-8")
+        fieldnames = ["step", "time_s", "env_id", "fault_joint", "motor_strength"]
+        for joint_type in self.JOINT_TYPES:
+            fieldnames.extend(
+                [
+                    f"{joint_type}_raw_action",
+                    f"{joint_type}_processed_target",
+                    f"{joint_type}_applied_target",
+                    f"{joint_type}_position",
+                    f"{joint_type}_velocity",
+                    f"{joint_type}_applied_torque",
+                    f"{joint_type}_position_error",
+                    f"{joint_type}_target_rate",
+                ]
+            )
+        self.writer = csv.DictWriter(self.file, fieldnames=fieldnames)
+        self.writer.writeheader()
+
+        self.current_fault: str | None = None
+        self.previous_target: dict[str, float] = {}
+        self.target_rate = {
+            joint_type: deque(maxlen=window_size) for joint_type in self.JOINT_TYPES
+        }
+        self.joint_velocity = {
+            joint_type: deque(maxlen=window_size) for joint_type in self.JOINT_TYPES
+        }
+        self.logged_samples = 0
+
+    def _reset_window(self, fault_name: str | None) -> None:
+        self.current_fault = fault_name
+        self.previous_target.clear()
+        for values in self.target_rate.values():
+            values.clear()
+        for values in self.joint_velocity.values():
+            values.clear()
+
+    def _applied_target(self, action_id: int, processed_target: float) -> float:
+        constrained_mask = getattr(self.action_term, "_constrained_mask", None)
+        lower_limits = getattr(self.action_term, "_constraint_lower_limits", None)
+        upper_limits = getattr(self.action_term, "_constraint_upper_limits", None)
+        if (
+            constrained_mask is None
+            or lower_limits is None
+            or upper_limits is None
+            or not bool(constrained_mask[action_id].item())
+        ):
+            return processed_target
+        lower = float(lower_limits[action_id].item())
+        upper = float(upper_limits[action_id].item())
+        return min(max(processed_target, lower), upper)
+
+    @staticmethod
+    def _rms(values: deque[float]) -> float:
+        return math.sqrt(sum(value * value for value in values) / len(values))
+
+    @staticmethod
+    def _correlation(first: deque[float], second: deque[float]) -> float:
+        first_mean = sum(first) / len(first)
+        second_mean = sum(second) / len(second)
+        first_centered = [value - first_mean for value in first]
+        second_centered = [value - second_mean for value in second]
+        covariance = sum(a * b for a, b in zip(first_centered, second_centered))
+        first_norm = math.sqrt(sum(value * value for value in first_centered))
+        second_norm = math.sqrt(sum(value * value for value in second_centered))
+        denominator = first_norm * second_norm
+        return covariance / denominator if denominator > 1.0e-8 else 0.0
+
+    def _motion_source(self, joint_type: str) -> tuple[str, float, float, float]:
+        target_rate = self.target_rate[joint_type]
+        velocity = self.joint_velocity[joint_type]
+        target_rate_rms = self._rms(target_rate)
+        velocity_rms = self._rms(velocity)
+        correlation = self._correlation(target_rate, velocity)
+
+        if velocity_rms < 0.1:
+            source = "quiet"
+        elif target_rate_rms < 0.25 * velocity_rms and abs(correlation) < 0.25:
+            source = "mostly-passive"
+        elif target_rate_rms >= 0.25 * velocity_rms and correlation > 0.35:
+            source = "target-driven"
+        else:
+            source = "mixed/unclear"
+        return source, target_rate_rms, velocity_rms, correlation
+
+    def record(self, step: int) -> None:
+        fault_ids = torch.nonzero(
+            self.asset.faulty_joint_idx[self.env_id], as_tuple=False
+        ).flatten()
+        if fault_ids.numel() == 0:
+            if self.current_fault is not None:
+                self._reset_window(None)
+            return
+
+        fault_id = int(fault_ids[0].item())
+        fault_name = self.asset.joint_names[fault_id]
+        leg_prefix = fault_name[:2]
+        if fault_name != self.current_fault:
+            self._reset_window(fault_name)
+
+        row: dict[str, str | int | float] = {
+            "step": step,
+            "time_s": step * self.dt,
+            "env_id": self.env_id,
+            "fault_joint": fault_name,
+            "motor_strength": float(
+                self.asset.motors_strength[self.env_id, fault_id].item()
+            ),
+        }
+        for joint_type in self.JOINT_TYPES:
+            joint_name = f"{leg_prefix}_{joint_type}_joint"
+            if joint_name not in self.asset_joint_id or joint_name not in self.action_joint_id:
+                raise KeyError(
+                    f"Could not map diagnostic joint {joint_name!r} into asset/action order."
+                )
+            asset_id = self.asset_joint_id[joint_name]
+            action_id = self.action_joint_id[joint_name]
+            raw_action = float(
+                self.action_term.raw_actions[self.env_id, action_id].item()
+            )
+            processed_target = float(
+                self.action_term.processed_actions[self.env_id, action_id].item()
+            )
+            applied_target = self._applied_target(action_id, processed_target)
+            position = float(self.asset.data.joint_pos[self.env_id, asset_id].item())
+            velocity = float(self.asset.data.joint_vel[self.env_id, asset_id].item())
+            torque = float(
+                self.asset.data.applied_torque[self.env_id, asset_id].item()
+            )
+            previous_target = self.previous_target.get(joint_type)
+            target_rate = (
+                0.0
+                if previous_target is None
+                else (applied_target - previous_target) / self.dt
+            )
+            self.previous_target[joint_type] = applied_target
+            if previous_target is not None:
+                self.target_rate[joint_type].append(target_rate)
+                self.joint_velocity[joint_type].append(velocity)
+
+            row.update(
+                {
+                    f"{joint_type}_raw_action": raw_action,
+                    f"{joint_type}_processed_target": processed_target,
+                    f"{joint_type}_applied_target": applied_target,
+                    f"{joint_type}_position": position,
+                    f"{joint_type}_velocity": velocity,
+                    f"{joint_type}_applied_torque": torque,
+                    f"{joint_type}_position_error": applied_target - position,
+                    f"{joint_type}_target_rate": target_rate,
+                }
+            )
+
+        self.writer.writerow(row)
+        self.logged_samples += 1
+        if self.logged_samples % self.print_interval == 0:
+            self.file.flush()
+            summaries = []
+            for joint_type in self.JOINT_TYPES:
+                if len(self.target_rate[joint_type]) < 2:
+                    continue
+                source, target_rms, velocity_rms, correlation = self._motion_source(
+                    joint_type
+                )
+                summaries.append(
+                    f"{joint_type}: source={source}, target_rate_rms={target_rms:.3f}, "
+                    f"velocity_rms={velocity_rms:.3f}, corr={correlation:.3f}"
+                )
+            print(
+                f"[FAULT MOTION] env={self.env_id}, fault={fault_name}, "
+                + "; ".join(summaries)
+            )
+
+    def close(self) -> None:
+        if not self.file.closed:
+            self.file.flush()
+            self.file.close()
+            print(f"[INFO] Saved fault-motion diagnostics to: {self.output_path}")
+
+
 def compute_fused_latent(actor, history: torch.Tensor) -> torch.Tensor:
     """Reproduce the EquivGCN actor's fused latent for a batch of histories."""
     required_attributes = (
@@ -234,10 +533,11 @@ def save_fused_latent_tsne(
     fault_mask: torch.Tensor,
     joint_names: list[str],
     output_path: str,
+    npz_output_path: str | None,
     perplexity: float,
     seed: int,
 ) -> None:
-    """Project fused latents to two dimensions and save a fault-colored PDF."""
+    """Save fused latent data and its fault-colored t-SNE projection."""
     try:
         import matplotlib.pyplot as plt
         import numpy as np
@@ -276,9 +576,30 @@ def save_fused_latent_tsne(
     ).fit_transform(latent_numpy)
 
     output_path = os.path.abspath(os.path.expanduser(output_path))
+    if npz_output_path is None:
+        npz_output_path = os.path.splitext(output_path)[0] + ".npz"
+    else:
+        npz_output_path = os.path.abspath(os.path.expanduser(npz_output_path))
+
     output_directory = os.path.dirname(output_path)
     if output_directory:
         os.makedirs(output_directory, exist_ok=True)
+    npz_output_directory = os.path.dirname(npz_output_path)
+    if npz_output_directory:
+        os.makedirs(npz_output_directory, exist_ok=True)
+
+    np.savez_compressed(
+        npz_output_path,
+        fused_latent=latent_numpy,
+        tsne_embedding=embedding,
+        fault_labels=fault_labels_numpy,
+        fault_mask=fault_mask_cpu.numpy(),
+        joint_names=np.asarray(joint_names),
+        healthy_class=np.asarray(healthy_class, dtype=np.int64),
+        collect_step=np.asarray(args_cli.latent_collect_step, dtype=np.int64),
+        tsne_perplexity=np.asarray(perplexity, dtype=np.float64),
+        seed=np.asarray(seed, dtype=np.int64),
+    )
 
     figure, axis = plt.subplots(figsize=(10, 8))
     colors = plt.get_cmap("tab20", healthy_class + 1)
@@ -304,13 +625,20 @@ def save_fused_latent_tsne(
     plt.close(figure)
     print(
         f"[INFO] Saved {latent_numpy.shape[0]} fused latent vectors "
-        f"({latent_numpy.shape[1]} dimensions) to: {output_path}"
+        f"({latent_numpy.shape[1]} dimensions) to: {output_path} and {npz_output_path}"
     )
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
+    if args_cli.export_only and args_cli.export is None:
+        raise ValueError("--export_only requires --export.")
+    if args_cli.fault_motion_steps < 0:
+        raise ValueError("--fault_motion_steps must be non-negative.")
+    if args_cli.fault_motion_steps > 0 and not args_cli.log_fault_motion:
+        raise ValueError("--fault_motion_steps requires --log_fault_motion.")
+
     # grab task name for checkpoint path
     task_name = args_cli.task.split(":")[-1]
     train_task_name = task_name.replace("-Play", "")
@@ -318,6 +646,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    if args_cli.terrain_type is not None:
+        terrain_generator = env_cfg.scene.terrain.terrain_generator
+        if terrain_generator is None:
+            raise ValueError("--terrain_type requires an environment with a terrain generator.")
+        if args_cli.terrain_type not in terrain_generator.sub_terrains:
+            available_terrains = ", ".join(sorted(terrain_generator.sub_terrains))
+            raise ValueError(
+                f"Unknown terrain type {args_cli.terrain_type!r}. "
+                f"Available terrain types: {available_terrains}."
+            )
+        terrain_cfg = terrain_generator.sub_terrains[args_cli.terrain_type]
+        terrain_cfg.proportion = 1.0
+        terrain_generator.sub_terrains = {args_cli.terrain_type: terrain_cfg}
+    if args_cli.fault_joint is not None:
+        if not hasattr(env_cfg.events, "randomize_actuator_faults"):
+            raise AttributeError("--fault_joint requires the randomize_actuator_faults event.")
+        fault_event = env_cfg.events.randomize_actuator_faults
+        fault_event.params["fixed_joint_idx"] = FAULT_JOINT_NAMES.index(args_cli.fault_joint)
+        print(f"[INFO] Fixed actuator fault joint: {args_cli.fault_joint}")
 
     # handle deprecated configurations
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
@@ -357,6 +704,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+
+    # Fault visualization is a play-only concern, so keep it out of the core
+    # environment and create the marker only when a viewport is available.
+    if not args_cli.headless:
+        marker_cfg = RAY_CASTER_MARKER_CFG.replace(prim_path="/Visuals/faulty_joint")
+        marker_cfg.markers["hit"].radius = 0.05
+        env.unwrapped._fault_marker = VisualizationMarkers(marker_cfg)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -401,34 +755,39 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             env.unwrapped.device,
         )
 
-    # export the trained policy to JIT and ONNX formats
+    # Export only when explicitly requested. Custom history-based actors expose
+    # two tensor inputs through their as_jit()/as_onnx() wrappers.
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-
-    if version.parse(installed_version) >= version.parse("4.0.0"):
-        # use the new export functions for rsl-rl >= 4.0.0
-        # runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
-        # runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
-        pass
-    else:
-        # extract the neural network for rsl-rl < 4.0.0
-        if version.parse(installed_version) >= version.parse("2.3.0"):
-            policy_nn = runner.alg.policy
-        else:
-            policy_nn = runner.alg.actor_critic
-
-        # extract the normalizer
-        if hasattr(policy_nn, "actor_obs_normalizer"):
-            normalizer = policy_nn.actor_obs_normalizer
-        elif hasattr(policy_nn, "student_obs_normalizer"):
-            normalizer = policy_nn.student_obs_normalizer
-        else:
-            normalizer = None
-
-        # export to JIT and ONNX
-        # export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-        # export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    if args_cli.export in ("jit", "both"):
+        runner.export_policy_to_jit(
+            path=export_model_dir, filename="policy.pt"
+        )
+        print(f"[INFO] Exported TorchScript policy to: {export_model_dir}/policy.pt")
+    if args_cli.export in ("onnx", "both"):
+        runner.export_policy_to_onnx(
+            path=export_model_dir, filename="policy.onnx"
+        )
+        print(f"[INFO] Exported ONNX policy to: {export_model_dir}/policy.onnx")
+    if args_cli.export_only:
+        env.close()
+        return
 
     dt = env.unwrapped.step_dt
+    fault_motion_logger = None
+    if args_cli.log_fault_motion:
+        fault_motion_output = args_cli.fault_motion_output
+        if fault_motion_output is None:
+            fault_motion_output = os.path.join(
+                os.path.dirname(resume_path), "fault_leg_motion.csv"
+            )
+        fault_motion_logger = FaultMotionLogger(
+            base_env=env.unwrapped,
+            env_id=args_cli.fault_motion_env,
+            output_path=fault_motion_output,
+            dt=dt,
+            print_interval=args_cli.fault_motion_print_interval,
+            window_size=args_cli.fault_motion_window,
+        )
 
     # reset environment
     obs = env.get_observations()
@@ -442,6 +801,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Vis debug joint fault
         if (
             not args_cli.collect_fused_latent
+            and hasattr(env.unwrapped, "_fault_marker")
             and (asset.faulty_joint_idx > 0).sum() > 0
         ):
             
@@ -517,6 +877,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     fault_mask=asset.faulty_joint_idx,
                     joint_names=list(asset.joint_names),
                     output_path=args_cli.latent_tsne_output,
+                    npz_output_path=args_cli.latent_npz_output,
                     perplexity=args_cli.latent_tsne_perplexity,
                     seed=env_cfg.seed,
                 )
@@ -524,6 +885,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
             # env stepping
             obs, _, dones, _ = env.step(actions)
+            if fault_motion_logger is not None:
+                fault_motion_logger.record(timestep)
             # reset recurrent states for episodes that have terminated
             if version.parse(installed_version) >= version.parse("4.0.0"):
                 policy.reset(dones)
@@ -551,6 +914,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             #     print("Fault pred pos rate:", predicted_positive_rate)
 
         timestep += 1
+        if (
+            fault_motion_logger is not None
+            and args_cli.fault_motion_steps > 0
+            and timestep >= args_cli.fault_motion_steps
+        ):
+            break
         if args_cli.video:
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
@@ -561,6 +930,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
+    if fault_motion_logger is not None:
+        fault_motion_logger.close()
     # close the simulator
     env.close()
 

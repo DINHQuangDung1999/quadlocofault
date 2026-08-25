@@ -67,16 +67,27 @@ class FTNetActor(nn.Module):
         # breakpoint()
         # Resolve observation groups and dimensions
         self.obs_hist_length, self.obs_dim = obs['history'].shape[1:]
-        self.priv_obs_dim = obs['critic'].shape[1]
+        policy_obs_dim = obs['policy'].shape[1]
+        if policy_obs_dim != self.obs_dim:
+            raise ValueError(
+                "FTNet requires current policy observations and each history frame "
+                f"to have the same width, but received {policy_obs_dim} and {self.obs_dim}."
+            )
+        if self.obs_dim != 49:
+            raise ValueError(
+                "FTNet expects the paper's 49-D proprioception (including four foot contacts), "
+                f"but received {self.obs_dim}."
+            )
+        self.priv_obs_dim = obs['privileged'].shape[1]
         # Observation normalization
         self.obs_normalization = obs_normalization
         if obs_normalization:
             self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
-            self.critic_obs_normalizer = EmpiricalNormalization(self.priv_obs_dim)
+            self.privileged_obs_normalizer = EmpiricalNormalization(self.priv_obs_dim)
             self.obs_hist_normalizer = EmpiricalNormalization([self.obs_hist_length, self.obs_dim])
         else:
             self.obs_normalizer = torch.nn.Identity()
-            self.critic_obs_normalizer = torch.nn.Identity()
+            self.privileged_obs_normalizer = torch.nn.Identity()
             self.obs_hist_normalizer = torch.nn.Identity()
 
         # Distribution
@@ -132,6 +143,8 @@ class FTNetActor(nn.Module):
         if self.training:
             actor_input = torch.cat([priv_latent, obs_policy], dim = -1)
         else:
+            # The privileged encoder is the teacher used during training. At
+            # deployment, FTNet must act from the history encoder alone.
             actor_input = torch.cat([hist_latent, obs_policy], dim = -1)
         # MLP forward pass
         # breakpoint()
@@ -149,7 +162,7 @@ class FTNetActor(nn.Module):
         """Build the model latent by concatenating and normalizing selected observation groups."""
         # Select and concatenate observations
         # Normalize observations
-        priv_obs = self.critic_obs_normalizer(obs['critic'])
+        priv_obs = self.privileged_obs_normalizer(obs['privileged'])
         priv_latent = self.priv_encoder_mlp(priv_obs)
         return priv_latent
     
@@ -218,7 +231,7 @@ class FTNetActor(nn.Module):
         if self.obs_normalization:
             # Update the normalizer parameters
             self.obs_normalizer.update(obs['policy'])  # type: ignore
-            self.critic_obs_normalizer.update(obs['critic'])
+            self.privileged_obs_normalizer.update(obs['privileged'])
             self.obs_hist_normalizer.update(obs['history'])
 
 

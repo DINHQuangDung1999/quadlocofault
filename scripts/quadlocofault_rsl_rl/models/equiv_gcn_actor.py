@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,6 +53,11 @@ class EquivGCNTemporalEncoder(nn.Module):
         self.num_joints = 12
 
         self.register_buffer("joint_permutation", torch.tensor(self._JOINT_PERMUTATION, dtype=torch.long))
+        joint_reflection_sign = torch.ones(self.num_joints)
+        joint_reflection_sign[[6, 9]] = -1.0
+        self.register_buffer(
+            "joint_reflection_sign", joint_reflection_sign, persistent=False
+        )
         # Sagittal reflection signs for [angular velocity, gravity, command].
         self.register_buffer(
             "base_reflection_sign",
@@ -101,7 +108,7 @@ class EquivGCNTemporalEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3 or x.shape[-1] != 45:
-            raise ValueError(f"Expected history shape (batch, history, 45), got {tuple(x.shape)}.")
+            raise ValueError("Expected history shape (batch, history, 45).")
 
         position = x[:, :, :12]
         velocity = x[:, :, 12:24]
@@ -120,8 +127,7 @@ class EquivGCNTemporalEncoder(nn.Module):
         # Canonicalize right hips (FR and RR, at graph-joint indices 6 and 9);
         # thigh/calf coordinates already share the left-side convention for
         # the Go2 joint definitions.
-        joints = joints.clone()
-        joints[:, :, (6, 9), :] *= -1.0
+        joints = joints * self.joint_reflection_sign.view(1, 1, -1, 1)
         bases = torch.stack((base, base * self.base_reflection_sign), dim=2)
         joints, bases = self._encode_temporal(joints, bases)
 
@@ -201,22 +207,146 @@ class FaultResidualTCN(nn.Module):
         velocity[:, :, self.right_hip_ids] *= -1.0
         previous_action[:, :, self.right_hip_ids] *= -1.0
 
-        means = []
-        differences = []
-        for feature in (position, velocity, previous_action):
-            left = feature.index_select(2, self.left_joint_ids)
-            right = feature.index_select(2, self.right_joint_ids)
-            means.append(0.5 * (left + right))
-            differences.append(0.5 * (left - right))
-
-        return torch.cat((*means, *differences, base), dim=-1)
+        position_left = position.index_select(2, self.left_joint_ids)
+        position_right = position.index_select(2, self.right_joint_ids)
+        velocity_left = velocity.index_select(2, self.left_joint_ids)
+        velocity_right = velocity.index_select(2, self.right_joint_ids)
+        action_left = previous_action.index_select(2, self.left_joint_ids)
+        action_right = previous_action.index_select(2, self.right_joint_ids)
+        return torch.cat(
+            (
+                0.5 * (position_left + position_right),
+                0.5 * (velocity_left + velocity_right),
+                0.5 * (action_left + action_right),
+                0.5 * (position_left - position_right),
+                0.5 * (velocity_left - velocity_right),
+                0.5 * (action_left - action_right),
+                base,
+            ),
+            dim=-1,
+        )
 
     def forward(self, history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if history.ndim != 3 or history.shape[-1] != 45:
-            raise ValueError(f"Expected history shape (batch, history, 45), got {tuple(history.shape)}.")
+            raise ValueError("Expected history shape (batch, history, 45).")
 
         tcn_input = self._symmetry_features(history).permute(0, 2, 1)
         fault_features = self.tcn(tcn_input)[:, :, -1]
+        fault_logits = self.fault_head(fault_features)
+        raw_gamma, raw_beta = self.film_head(fault_features.detach()).chunk(2, dim=-1)
+        gamma = self.film_scale * torch.tanh(raw_gamma)
+        beta = self.film_scale * torch.tanh(raw_beta)
+        return fault_logits, gamma, beta
+
+
+class FaultResidualMLP(nn.Module):
+    """MLP alternative to :class:`FaultResidualTCN`.
+
+    The input symmetry transformation, classification head, detached FiLM
+    branch, output scaling, and return interface intentionally match the TCN.
+    Only the history feature extractor differs: the complete transformed
+    history is flattened and processed by an MLP.
+    """
+
+    _LEFT_JOINT_IDS = [0, 2, 4, 6, 8, 10]
+    _RIGHT_JOINT_IDS = [1, 3, 5, 7, 9, 11]
+    _RIGHT_HIP_IDS = [1, 3]
+
+    def __init__(
+        self,
+        history_length: int,
+        hidden_dim: int,
+        film_dim: int,
+        mlp_hidden_dims: tuple[int, ...] | list[int] = (128, 64),
+        film_scale: float = 0.5,
+        num_fault_classes: int = 12,
+    ) -> None:
+        super().__init__()
+        if history_length <= 0:
+            raise ValueError(f"history_length must be positive, got {history_length}.")
+        if not mlp_hidden_dims:
+            raise ValueError("mlp_hidden_dims must contain at least one layer.")
+        if num_fault_classes not in (12, 13):
+            raise ValueError(
+                f"num_fault_classes must be 12 or 13, got {num_fault_classes}."
+            )
+
+        self.history_length = history_length
+        self.film_scale = film_scale
+        self.num_fault_classes = num_fault_classes
+        self.register_buffer("left_joint_ids", torch.tensor(self._LEFT_JOINT_IDS, dtype=torch.long))
+        self.register_buffer("right_joint_ids", torch.tensor(self._RIGHT_JOINT_IDS, dtype=torch.long))
+        self.register_buffer("right_hip_ids", torch.tensor(self._RIGHT_HIP_IDS, dtype=torch.long))
+
+        feature_layers: list[nn.Module] = []
+        input_dim = history_length * 45
+        for output_dim in mlp_hidden_dims:
+            feature_layers.extend((nn.Linear(input_dim, output_dim), nn.ELU()))
+            input_dim = output_dim
+        feature_layers.append(nn.Linear(input_dim, hidden_dim))
+        feature_layers.append(nn.ELU())
+        self.mlp = nn.Sequential(*feature_layers)
+
+        self.fault_head = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ELU(),
+            nn.Linear(64, 64),
+            nn.ELU(),
+            nn.Linear(64, num_fault_classes),
+        )
+        self.film_head = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ELU(),
+            nn.Linear(64, 64),
+            nn.ELU(),
+            nn.Linear(64, 2 * film_dim),
+        )
+        final_film_layer = self.film_head[-1]
+        nn.init.zeros_(final_film_layer.weight)
+        nn.init.zeros_(final_film_layer.bias)
+
+    def _symmetry_features(self, history: torch.Tensor) -> torch.Tensor:
+        """Return pair means/differences and base features with shape [B, H, 45]."""
+        position = history[:, :, :12].clone()
+        velocity = history[:, :, 12:24].clone()
+        previous_action = history[:, :, 24:36].clone()
+        base = history[:, :, 36:45]
+
+        position[:, :, self.right_hip_ids] *= -1.0
+        velocity[:, :, self.right_hip_ids] *= -1.0
+        previous_action[:, :, self.right_hip_ids] *= -1.0
+
+        position_left = position.index_select(2, self.left_joint_ids)
+        position_right = position.index_select(2, self.right_joint_ids)
+        velocity_left = velocity.index_select(2, self.left_joint_ids)
+        velocity_right = velocity.index_select(2, self.right_joint_ids)
+        action_left = previous_action.index_select(2, self.left_joint_ids)
+        action_right = previous_action.index_select(2, self.right_joint_ids)
+        return torch.cat(
+            (
+                0.5 * (position_left + position_right),
+                0.5 * (velocity_left + velocity_right),
+                0.5 * (action_left + action_right),
+                0.5 * (position_left - position_right),
+                0.5 * (velocity_left - velocity_right),
+                0.5 * (action_left - action_right),
+                base,
+            ),
+            dim=-1,
+        )
+
+    def forward(self, history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (
+            history.ndim != 3
+            or history.shape[1] != self.history_length
+            or history.shape[2] != 45
+        ):
+            raise ValueError(
+                f"Expected history shape (batch, {self.history_length}, 45)."
+            )
+
+        mlp_input = self._symmetry_features(history).flatten(start_dim=1)
+        fault_features = self.mlp(mlp_input)
         fault_logits = self.fault_head(fault_features)
         raw_gamma, raw_beta = self.film_head(fault_features.detach()).chunk(2, dim=-1)
         gamma = self.film_scale * torch.tanh(raw_gamma)
@@ -240,6 +370,8 @@ class EquivGCNActor(nn.Module):
         gcn_hidden_dim: int = 16,
         gcn_out_dim: int = 16,
         tcn_hidden_dim: int = 16,
+        fault_encoder_type: str = "tcn",
+        fault_mlp_hidden_dims: tuple[int, ...] | list[int] = (128, 64),
         setup: int = 1,
         **_: object,
     ) -> None:
@@ -275,10 +407,23 @@ class EquivGCNActor(nn.Module):
             gcn_hidden_dim=gcn_hidden_dim,
             gcn_out_dim=gcn_out_dim,
         )
-        self.fault_residual_encoder = FaultResidualTCN(
-            hidden_dim=tcn_hidden_dim,
-            film_dim=gcn_out_dim,
-        )
+        if fault_encoder_type == "tcn":
+            self.fault_residual_encoder = FaultResidualTCN(
+                hidden_dim=tcn_hidden_dim,
+                film_dim=gcn_out_dim,
+            )
+        elif fault_encoder_type == "mlp":
+            self.fault_residual_encoder = FaultResidualMLP(
+                history_length=self.obs_hist_length,
+                hidden_dim=tcn_hidden_dim,
+                film_dim=gcn_out_dim,
+                mlp_hidden_dims=fault_mlp_hidden_dims,
+            )
+        else:
+            raise ValueError(
+                "fault_encoder_type must be either 'tcn' or 'mlp', "
+                f"got {fault_encoder_type!r}."
+            )
         # tcn_path = "/home/dung-admin/quadloco_ws/quadlocofault/datasets/prop_fault/FTNet-Isaac-Velocity-Rough-Unitree-Go2-Play-v0/2026-07-27_11-45-57/fault_tcn_runs/2026-07-27_11-53-18/best.pt"
         # self.fault_residual_encoder.load_state_dict(
         #     torch.load(tcn_path, weights_only=False)['classifier_state_dict'], 
@@ -383,7 +528,96 @@ class EquivGCNActor(nn.Module):
             raise RuntimeError("EquivGCNActor has no output distribution.")
         return self.distribution.kl_divergence(old_params, new_params)
 
+    def as_jit(self) -> nn.Module:
+        """Return the complete deterministic actor path for TorchScript export."""
+        return _TorchEquivGCNActor(self)
+
+    def as_onnx(self, verbose: bool = False) -> nn.Module:
+        """Return the complete deterministic actor path for ONNX export."""
+        return _OnnxEquivGCNActor(self, verbose)
+
     def update_normalization(self, obs: TensorDict) -> None:
         if isinstance(self.obs_normalizer, EmpiricalNormalization):
             self.obs_normalizer.update(obs["policy"])
             self.obs_hist_normalizer.update(obs["history"])
+
+
+class _TorchEquivGCNActor(nn.Module):
+    """Deployable deterministic EquivGCN actor with explicit tensor inputs."""
+
+    def __init__(self, model: EquivGCNActor) -> None:
+        super().__init__()
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.obs_hist_normalizer = copy.deepcopy(model.obs_hist_normalizer)
+        self.gcn_encoder = copy.deepcopy(model.gcn_encoder)
+        self.fault_residual_encoder = copy.deepcopy(model.fault_residual_encoder)
+        self.actor_mlp = copy.deepcopy(model.actor_mlp)
+        self.obs_dim = model.obs_dim
+        self.obs_hist_length = model.obs_hist_length
+        if model.distribution is not None:
+            self.deterministic_output = (
+                model.distribution.as_deterministic_output_module()
+            )
+        else:
+            self.deterministic_output = nn.Identity()
+
+        # Loading weights into LazyLinear parameters does not necessarily
+        # replace the LazyLinear module class. TorchScript then tries to
+        # compile LazyModuleMixin's keyword-argument initialization hook,
+        # which it does not support. One eager pass converts every copied lazy
+        # layer to its concrete Linear form before scripting or ONNX tracing.
+        export_device = model.gcn_encoder.adj_norm.device
+        with torch.no_grad():
+            self.forward(
+                torch.zeros(1, self.obs_dim, device=export_device),
+                torch.zeros(
+                    1,
+                    self.obs_hist_length,
+                    self.obs_dim,
+                    device=export_device,
+                ),
+            )
+
+    def forward(self, obs: torch.Tensor, obs_history: torch.Tensor) -> torch.Tensor:
+        obs = self.obs_normalizer(obs)
+        obs_history = self.obs_hist_normalizer(obs_history)
+
+        gcn_latent = self.gcn_encoder(obs_history).mean(dim=1)
+        fault_logits, gamma, beta = self.fault_residual_encoder(obs_history)
+        fault_probability = torch.sigmoid(fault_logits)
+        fault_gate = fault_probability.amax(dim=1, keepdim=True)
+        fused_latent = (
+            (1.0 + fault_gate * gamma) * gcn_latent
+            + fault_gate * beta
+        )
+        actor_input = torch.cat(
+            (obs, fault_probability, fused_latent), dim=-1
+        )
+        return self.deterministic_output(self.actor_mlp(actor_input))
+
+    @torch.jit.export
+    def reset(self) -> None:
+        """Reset recurrent export state (no-op for this feed-forward actor)."""
+        pass
+
+
+class _OnnxEquivGCNActor(_TorchEquivGCNActor):
+    """ONNX wrapper supplying input metadata and representative tensors."""
+
+    def __init__(self, model: EquivGCNActor, verbose: bool = False) -> None:
+        super().__init__(model)
+        self.verbose = verbose
+
+    def get_dummy_inputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            torch.zeros(1, self.obs_dim),
+            torch.zeros(1, self.obs_hist_length, self.obs_dim),
+        )
+
+    @property
+    def input_names(self) -> list[str]:
+        return ["obs", "obs_history"]
+
+    @property
+    def output_names(self) -> list[str]:
+        return ["actions"]

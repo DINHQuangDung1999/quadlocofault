@@ -151,7 +151,14 @@ class DreamFLEXActor(nn.Module):
         mean_vel = self.mean_vel_encoder_mlp(distribution)
         # logvar_vel = self.logvar_vel_encoder_mlp(distribution)
 
-        code_latent = self.reparameterise(mean_latent,logvar_latent)
+        # Sample the variational code while learning, but use its mean for
+        # deterministic deployment/evaluation. Action determinism alone is
+        # insufficient if the latent itself is still sampled.
+        code_latent = (
+            self.reparameterise(mean_latent, logvar_latent)
+            if self.training
+            else mean_latent
+        )
         # code_vel = self.reparameterise(mean_vel,logvar_vel)
         code_vel = mean_vel
         logvar_vel = torch.zeros_like(mean_vel)
@@ -263,9 +270,7 @@ class _TorchDreamFLEXActor(nn.Module):
 
         code_vel = self.mean_vel_encoder_mlp(distribution)
         mean_latent = self.mean_latent_encoder_mlp(distribution)
-        logvar_latent = self.logvar_latent_encoder_mlp(distribution)
-        latent_std = torch.exp(0.5 * logvar_latent)
-        code_latent = mean_latent + latent_std * torch.randn_like(latent_std)
+        code_latent = mean_latent
 
         fault_probability = torch.sigmoid(self.fault_logit_encoder_mlp(distribution))
         gamma_beta = self.fault_decoder_mlp(fault_probability)

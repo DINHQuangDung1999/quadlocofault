@@ -12,6 +12,15 @@ from isaaclab_quadlocofault_rl.rsl_rl.rl_cfg import RslRlFTNetActorCfg, \
     RslRlPINNActorCfg, \
     RslRlGCNActorCfg
 
+
+@configclass
+class RslRlPpoEquivGCNAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    """PPO configuration with focal-loss parameters for EquivGCN."""
+
+    fault_focal_gamma: float = 2.0
+    fault_focal_alpha: float = 0.5
+
+
 @configclass
 class UnitreeGo2PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
@@ -176,13 +185,40 @@ class UnitreeGo2RoughPPOGCNRunnerCfg(UnitreeGo2PPORunnerCfg):
 
 @configclass
 class UnitreeGo2RoughPPOEquivGCNRunnerCfg(UnitreeGo2RoughPPOGCNRunnerCfg):
+    algorithm = RslRlPpoEquivGCNAlgorithmCfg(
+        class_name="PPOEquivGCN",
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        fault_focal_gamma=2.0,
+        fault_focal_alpha=0.5,
+    )
+
     def __post_init__(self):
         super().__post_init__()
         self.actor.class_name = "EquivGCNActor"
         self.algorithm.class_name = "PPOEquivGCN"
-        # One faulty joint is supervised against the other eleven joint outputs.
-        # self.algorithm.fault_pos_weight = 11.0
         self.experiment_name = "unitree_go2_rough_equiv_gcn"
+
+
+@configclass
+class UnitreeGo2RoughPPOEquivGCNMLPRunnerCfg(UnitreeGo2RoughPPOEquivGCNRunnerCfg):
+    """EquivGCN ablation using an MLP instead of the fault-residual TCN."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actor.fault_encoder_type = "mlp"
+        self.actor.fault_mlp_hidden_dims = (512, 256, 128)
+        self.experiment_name = "unitree_go2_rough_equiv_gcn_mlp"
 
 
 @configclass

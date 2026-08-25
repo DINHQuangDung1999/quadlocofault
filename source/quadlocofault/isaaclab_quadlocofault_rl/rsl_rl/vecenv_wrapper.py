@@ -8,8 +8,7 @@ import torch
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
-from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
-from isaaclab_quadlocofault.custom_manager_based_rl_env import CustomManagerBasedRLEnv
+from isaaclab.envs import ManagerBasedRLEnv
 
 
 class CustomRslRlVecEnvWrapper(VecEnv):
@@ -31,13 +30,13 @@ class CustomRslRlVecEnvWrapper(VecEnv):
         https://github.com/leggedrobotics/rsl_rl/blob/master/rsl_rl/env/vec_env.py
     """
 
-    def __init__(self, env: CustomManagerBasedRLEnv, clip_actions: float | None = None):
+    def __init__(self, env: ManagerBasedRLEnv, clip_actions: float | None = None):
         """Initializes the wrapper.
         """
         # check that input is valid
-        if not isinstance(env.unwrapped, CustomManagerBasedRLEnv):
+        if not isinstance(env.unwrapped, ManagerBasedRLEnv):
             raise ValueError(
-                "The environment must be inherited from CustomManagerBasedRLEnv or DirectRLEnv. Environment type:"
+                "The environment must be inherited from ManagerBasedRLEnv. Environment type:"
                 f" {type(env)}"
             )
         # initialize the wrapper
@@ -113,7 +112,7 @@ class CustomRslRlVecEnvWrapper(VecEnv):
         return cls.__name__
 
     @property
-    def unwrapped(self) -> CustomManagerBasedRLEnv:
+    def unwrapped(self) -> ManagerBasedRLEnv:
         """Returns the base environment of the wrapper.
 
         This will be the bare :class:`gymnasium.Env` environment, underneath all layers of wrappers.
@@ -169,6 +168,11 @@ class CustomRslRlVecEnvWrapper(VecEnv):
         # record step information
         current_ep_duration = self.env.unwrapped.episode_length_buf.clone()
         obs_dict, rew, terminated, truncated, extras = self.env.step(actions)
+        # Preserve the project-level switch while keeping Isaac Lab's default
+        # environment implementation. Reward-manager term logs remain raw;
+        # only the scalar reward delivered to PPO is clipped.
+        if getattr(self.unwrapped.cfg, "only_positive_rewards", False):
+            rew.clamp_min_(0.0)
 
         # compute dones for compatibility with RSL-RL
         dones = (terminated | truncated).to(dtype=torch.long)

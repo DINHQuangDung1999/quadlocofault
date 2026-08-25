@@ -31,6 +31,17 @@ def _safe_obs_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def foot_contact_boolean(
+    env: ManagerBasedEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Return one binary contact indicator for each configured foot."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    foot_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    return (torch.linalg.vector_norm(foot_forces, dim=-1) > threshold).float()
+
+
 class CustomProprioceptiveObservations(ManagerTermBase):
 
     def __init__(self, cfg: ObservationTermCfg, 

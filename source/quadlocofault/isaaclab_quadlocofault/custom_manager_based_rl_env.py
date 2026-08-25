@@ -148,6 +148,8 @@ class CustomManagerBasedRLEnv(CustomManagerBasedEnv, gym.Env):
         # -- reward computation
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
+        if getattr(self.cfg, "only_positive_rewards", False):
+            self.reward_buf.clamp_min_(0.0)
         
         if len(self.recorder_manager.active_terms) > 0:
             # update observations for recording if needed
@@ -179,7 +181,10 @@ class CustomManagerBasedRLEnv(CustomManagerBasedEnv, gym.Env):
             self.event_manager.apply(mode="interval", dt=self.step_dt)
         # -- compute observations
         # note: done after reset to get the correct observations for reset envs
-        self.obs_buf = self.observation_manager.compute()
+        # Advance observation histories exactly once per environment step.
+        # Recorder-only computations above intentionally keep the default
+        # update_history=False to avoid appending the same state twice.
+        self.obs_buf = self.observation_manager.compute(update_history=True)
 
         # return observations, rewards, resets and extras
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras

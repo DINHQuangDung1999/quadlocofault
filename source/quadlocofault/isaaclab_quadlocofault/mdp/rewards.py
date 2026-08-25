@@ -12,9 +12,11 @@ specify the reward function and its parameters.
 from __future__ import annotations
 
 import torch
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers.manager_base import ManagerTermBase
+from isaaclab.managers.manager_term_cfg import RewardTermCfg
 from isaaclab.sensors import ContactSensor, RayCaster
 from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
 from isaaclab.assets import Articulation, RigidObject
@@ -58,7 +60,7 @@ def power_distribution(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Scene
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
     power = asset.data.applied_torque[:, asset_cfg.joint_ids] * asset.data.joint_vel[:, asset_cfg.joint_ids]
-    return torch.var(power, dim=1)
+    return torch.var(torch.abs(power), dim=1)
 
 
 def joint_power(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
@@ -70,6 +72,67 @@ def joint_power(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityC
     asset: Articulation = env.scene[asset_cfg.name]
     power = asset.data.applied_torque[:, asset_cfg.joint_ids] * asset.data.joint_vel[:, asset_cfg.joint_ids]
     return torch.sum(torch.abs(power), dim=1)
+
+
+class ActionSmoothnessPenalty(ManagerTermBase):
+    """Penalize the squared second-order finite difference of policy actions."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._prev_prev_action = torch.zeros_like(env.action_manager.action)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            self._prev_prev_action.zero_()
+        else:
+            self._prev_prev_action[env_ids] = 0.0
+
+    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+        action = env.action_manager.action
+        prev_action = env.action_manager.prev_action
+        second_difference = action - 2.0 * prev_action + self._prev_prev_action
+        self._prev_prev_action.copy_(prev_action)
+        return torch.sum(torch.square(second_difference), dim=1)
+
+
+class DreamWaQActionSmoothnessPenalty(ManagerTermBase):
+    """DreamWaQ second-difference penalty on processed joint targets.
+
+    DreamWaQ masks the first two steps of every episode. Keeping that state in
+    the reward term also avoids treating a reset discontinuity as an action
+    smoothness violation.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._previous_target = torch.zeros_like(env.action_manager.action)
+        self._previous_previous_target = torch.zeros_like(env.action_manager.action)
+        self._valid_steps = torch.zeros(
+            env.num_envs, dtype=torch.long, device=env.device
+        )
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            self._previous_target.zero_()
+            self._previous_previous_target.zero_()
+            self._valid_steps.zero_()
+        else:
+            self._previous_target[env_ids] = 0.0
+            self._previous_previous_target[env_ids] = 0.0
+            self._valid_steps[env_ids] = 0
+
+    def __call__(self, env: ManagerBasedRLEnv, action_name: str) -> torch.Tensor:
+        target = env.action_manager.get_term(action_name).processed_actions
+        second_difference = (
+            target - 2.0 * self._previous_target + self._previous_previous_target
+        )
+        penalty = torch.sum(torch.square(second_difference), dim=1)
+        penalty *= self._valid_steps.ge(2)
+
+        self._previous_previous_target.copy_(self._previous_target)
+        self._previous_target.copy_(target)
+        self._valid_steps.add_(1)
+        return penalty
 
 
 def foot_clearance_reward(
@@ -90,17 +153,41 @@ def foot_clearance_reward_dreamflex(
     sensor_cfg: SceneEntityCfg,
     target_height: float,
 ):
+    """Penalize healthy swing feet that deviate from the target terrain clearance.
+
+    Ray-caster misses are represented by non-finite hit positions. Ignore those
+    rays when estimating terrain height and disable the term for environments
+    where the scanner has no valid hits.
+    """
     asset: Articulation = env.scene[asset_cfg.name]
     sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
 
     foot_ids, foot_names = asset.find_bodies(".*_foot", preserve_order=True)
     foot_height_w = asset.data.body_pos_w[:, foot_ids, 2]
-    terrain_height_w = torch.mean(sensor.data.ray_hits_w[..., 2], dim=1, keepdim=True)
+    ray_hit_height_w = sensor.data.ray_hits_w[..., 2]
+    valid_ray_mask = torch.isfinite(ray_hit_height_w)
+    valid_ray_count = valid_ray_mask.sum(dim=1, keepdim=True)
+
+    # Invalid values must be removed before the reduction: inf * 0 is NaN.
+    valid_ray_height_sum = torch.where(
+        valid_ray_mask,
+        ray_hit_height_w,
+        torch.zeros_like(ray_hit_height_w),
+    ).sum(dim=1, keepdim=True)
+    terrain_height_w = valid_ray_height_sum / valid_ray_count.clamp_min(1)
+
     foot_z_error = torch.square(foot_height_w - terrain_height_w - target_height)
     foot_xy_speed = torch.norm(asset.data.body_lin_vel_w[:, foot_ids, :2], dim=-1)
-    normal_leg_mask = 1.0 - _get_faulty_leg_mask(asset, foot_names)
+    healthy_leg_mask = _get_faulty_leg_mask(asset, foot_names) < 0.5
+    valid_terrain_mask = valid_ray_count > 0
 
-    return torch.sum(foot_z_error * foot_xy_speed * normal_leg_mask, dim=1)
+    clearance_penalty = foot_z_error * foot_xy_speed
+    clearance_penalty = torch.where(
+        healthy_leg_mask & valid_terrain_mask,
+        clearance_penalty,
+        torch.zeros_like(clearance_penalty),
+    )
+    return torch.sum(clearance_penalty, dim=1)
 
 
 def faulty_leg_contact_reward(
@@ -117,6 +204,165 @@ def faulty_leg_contact_reward(
     foot_contact_force = torch.norm(contact_sensor.data.net_forces_w[:, foot_sensor_ids, :], dim=-1)
     faulty_contacts = (foot_contact_force > threshold).float() * faulty_leg_mask
     return torch.sum(faulty_contacts, dim=1)
+
+
+def faulty_leg_vertical_load(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return the faulty leg's vertical support load normalized by robot weight.
+
+    Averaging the contact sensor's existing short history reduces single-step
+    contact noise.  This function returns a non-negative cost and should be
+    configured with a negative reward weight.  Integrated over an episode, the
+    term is proportional to the vertical support impulse transmitted through
+    the faulty leg.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    foot_sensor_ids, foot_names = contact_sensor.find_bodies(
+        ".*_foot", preserve_order=True
+    )
+    vertical_load = torch.abs(
+        contact_sensor.data.net_forces_w_history[:, :, foot_sensor_ids, 2]
+    ).mean(dim=1)
+    faulty_leg_mask = _get_faulty_leg_mask(asset, foot_names)
+
+    robot_mass = asset.root_physx_view.get_masses().to(asset.device).sum(dim=1)
+    robot_weight = robot_mass * 9.81
+    return torch.sum(vertical_load * faulty_leg_mask, dim=1) / robot_weight.clamp_min(1.0e-6)
+
+
+def faulty_foot_planar_velocity_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*_foot"),
+) -> torch.Tensor:
+    """Penalize squared world-frame planar velocity of the faulty foot.
+
+    A planted foot is approximately stationary in the world frame, so this
+    quantity penalizes both swing and ground sliding without requiring a
+    contact-state gate.  Only the leg containing the configured faulty joint
+    contributes.  The vertical component is deliberately excluded so the foot
+    can still accommodate rough terrain.
+
+    This function returns a non-negative cost and should be configured with a
+    negative reward weight.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    body_ids = asset_cfg.body_ids
+    if isinstance(body_ids, slice):
+        foot_names = asset.body_names[body_ids]
+    elif isinstance(body_ids, int):
+        foot_names = [asset.body_names[body_ids]]
+    else:
+        foot_names = [asset.body_names[body_id] for body_id in body_ids]
+
+    foot_planar_speed_l2 = torch.sum(
+        torch.square(asset.data.body_lin_vel_w[:, body_ids, :2]), dim=-1
+    )
+    faulty_leg_mask = _get_faulty_leg_mask(asset, foot_names)
+    return torch.sum(foot_planar_speed_l2 * faulty_leg_mask, dim=1)
+
+
+def hip_fault_thigh_calf_velocity_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize thigh and calf velocity only on a hip-faulted leg.
+
+    A one-time compensating bend incurs a short-lived cost, while repeated
+    flexion accumulates cost throughout the episode.  The passive faulty hip
+    and every joint on healthy legs are excluded.  This function assumes the
+    project's hip/thigh/calf x FL/FR/RL/RR joint ordering and returns a
+    non-negative cost for use with a negative reward weight.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_velocity = asset.data.joint_vel.reshape(asset.num_instances, 3, 4)
+    faults = asset.faulty_joint_idx.reshape(asset.num_instances, 3, 4).bool()
+
+    hip_fault_mask = faults[:, 0, :].unsqueeze(1)
+    thigh_calf_velocity_l2 = torch.square(joint_velocity[:, 1:, :])
+    return torch.sum(thigh_calf_velocity_l2 * hip_fault_mask, dim=(1, 2))
+
+
+class FaultyHipFootLateralDeviationL2(ManagerTermBase):
+    """Penalize lateral foot displacement from its nominal hip-relative offset.
+
+    The nominal signed offsets are captured once from the initialized robot,
+    rather than assuming that each foot should have zero lateral displacement
+    from its hip link origin.  Only a leg with a faulty hip
+    abduction/adduction joint contributes.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.asset: Articulation = env.scene[asset_cfg.name]
+
+        self.foot_ids, self.foot_names = self.asset.find_bodies(
+            ".*_foot", preserve_order=True
+        )
+        hip_body_ids, hip_body_names = self.asset.find_bodies(
+            ".*_hip", preserve_order=True
+        )
+        hip_joint_ids, hip_joint_names = self.asset.find_joints(
+            ".*_hip_joint", preserve_order=True
+        )
+
+        hip_body_id_by_prefix = {
+            name[:2]: body_id for body_id, name in zip(hip_body_ids, hip_body_names)
+        }
+        hip_joint_id_by_prefix = {
+            name[:2]: joint_id for joint_id, name in zip(hip_joint_ids, hip_joint_names)
+        }
+        foot_prefixes = [name[:2] for name in self.foot_names]
+        missing_prefixes = sorted(
+            set(foot_prefixes)
+            - (hip_body_id_by_prefix.keys() & hip_joint_id_by_prefix.keys())
+        )
+        if missing_prefixes:
+            raise ValueError(
+                "Could not pair feet with hip bodies and joints for prefixes "
+                f"{missing_prefixes}."
+            )
+
+        self.hip_body_ids = [
+            hip_body_id_by_prefix[prefix] for prefix in foot_prefixes
+        ]
+        self.hip_joint_ids = [
+            hip_joint_id_by_prefix[prefix] for prefix in foot_prefixes
+        ]
+        self.num_feet = len(self.foot_ids)
+        self.nominal_lateral_offset: torch.Tensor | None = None
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        asset_cfg: SceneEntityCfg,
+    ) -> torch.Tensor:
+        foot_to_hip_w = (
+            self.asset.data.body_pos_w[:, self.foot_ids, :]
+            - self.asset.data.body_pos_w[:, self.hip_body_ids, :]
+        )
+        yaw_w = yaw_quat(self.asset.data.root_quat_w)
+        yaw_feet = yaw_w.unsqueeze(1).expand(-1, self.num_feet, -1).reshape(-1, 4)
+        foot_to_hip_b = quat_rotate_inverse(
+            yaw_feet, foot_to_hip_w.reshape(-1, 3)
+        ).view(self.asset.num_instances, self.num_feet, 3)
+        lateral_offset = foot_to_hip_b[..., 1]
+
+        if self.nominal_lateral_offset is None:
+            self.nominal_lateral_offset = lateral_offset.detach().mean(
+                dim=0, keepdim=True
+            )
+
+        hip_fault_mask = self.asset.faulty_joint_idx[:, self.hip_joint_ids].float()
+        lateral_deviation_l2 = torch.square(
+            lateral_offset - self.nominal_lateral_offset
+        )
+        return torch.sum(lateral_deviation_l2 * hip_fault_mask, dim=1)
 
 
 def faulty_leg_link_contact_reward(
@@ -234,6 +480,7 @@ def feet_air_time(
     sensor_cfg: SceneEntityCfg,
     threshold: float,
     asset_cfg: SceneEntityCfg | None = None,
+    ignore_faulty_legs: bool = False,
 ) -> torch.Tensor:
     """Reward long steps taken by the feet using L2-kernel.
 
@@ -250,13 +497,15 @@ def feet_air_time(
     last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
     air_time_reward = (last_air_time - threshold) * first_contact
 
-    # DreamFLEX defines this reward only for normal feet. Keep the generic
-    # Isaac Lab behavior (all feet) when no articulation is provided.
-    # if asset_cfg is not None:
-    asset: Articulation = env.scene[asset_cfg.name]
-    foot_ids, foot_names = asset.find_bodies(".*_foot", preserve_order=True)
-    faulty_leg_mask = _get_faulty_leg_mask(asset, foot_names)
-    air_time_reward *= 1.0 - faulty_leg_mask
+    # DreamFLEX applies this term only to healthy feet, whereas FT-Net's Table I
+    # sums it over all four feet.
+    if ignore_faulty_legs:
+        if asset_cfg is None:
+            raise ValueError("asset_cfg is required when ignore_faulty_legs=True.")
+        asset: Articulation = env.scene[asset_cfg.name]
+        _, foot_names = asset.find_bodies(".*_foot", preserve_order=True)
+        faulty_leg_mask = _get_faulty_leg_mask(asset, foot_names)
+        air_time_reward *= 1.0 - faulty_leg_mask
 
     reward = torch.sum(air_time_reward, dim=1)
     # no reward for zero command
@@ -400,7 +649,8 @@ def vhip_style_reward_ftnet(
     theta = torch.where(has_contact, theta, torch.zeros_like(theta))
 
     g = 9.81
-    theta_ddot = (g / l_norm) * torch.sin(theta)
+    # FT-Net Table I penalizes squared VHIP angular acceleration.
+    theta_ddot = torch.square((g / l_norm) * torch.sin(theta))
     theta_ddot = torch.where(has_contact, theta_ddot, torch.zeros_like(theta_ddot))
 
     com_xy = com_w[:, :2]
@@ -485,7 +735,111 @@ def faulty_joint_motion_reward_dreamflex(
 
     return torch.sum(((q - q_des) ** 2) * faulty_mask, dim=1)
 
-def raibert_foot_placement_reward(
+
+class RaibertFootPlacementReward(ManagerTermBase):
+    """Penalize healthy swing-foot error from the Raibert landing location.
+
+    Following Song et al. (CoRL 2024), the desired planar landing location is
+
+        p_land = p_hip_ground + v_com * stance_time / 2.
+
+    All quantities are expressed in the yaw-aligned body frame.  Contact data
+    are used only to restrict this minimal, phase-free version to swing legs;
+    no additional sensor or prescribed gait phase is required.
+    """
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.asset: Articulation = env.scene[cfg.params["asset_cfg"].name]
+        self.contact_sensor: ContactSensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+        self.stance_time: float = cfg.params["stance_time"]
+        self.contact_threshold: float = cfg.params.get("contact_threshold", 1.0)
+        if self.stance_time <= 0.0:
+            raise ValueError(f"stance_time must be positive, got {self.stance_time}.")
+
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.foot_ids = list(asset_cfg.body_ids)
+        self.foot_names = [self.asset.body_names[body_id] for body_id in self.foot_ids]
+        foot_prefixes = [name[:2] for name in self.foot_names]
+
+        hip_ids, hip_names = self.asset.find_bodies(".*_hip", preserve_order=True)
+        hip_id_by_prefix = {name[:2]: body_id for body_id, name in zip(hip_ids, hip_names)}
+        missing_hips = sorted(set(foot_prefixes) - hip_id_by_prefix.keys())
+        if missing_hips:
+            raise ValueError(
+                "Raibert reward could not pair feet with hip bodies for prefixes "
+                f"{missing_hips}. Available hip bodies: {hip_names}."
+            )
+        self.hip_ids = [hip_id_by_prefix[prefix] for prefix in foot_prefixes]
+
+        sensor_foot_ids, sensor_foot_names = self.contact_sensor.find_bodies(
+            ".*_foot", preserve_order=True
+        )
+        sensor_id_by_prefix = {
+            name[:2]: body_id for body_id, name in zip(sensor_foot_ids, sensor_foot_names)
+        }
+        missing_sensor_feet = sorted(set(foot_prefixes) - sensor_id_by_prefix.keys())
+        if missing_sensor_feet:
+            raise ValueError(
+                "Raibert reward could not pair asset feet with contact-sensor feet for prefixes "
+                f"{missing_sensor_feet}. Available sensor feet: {sensor_foot_names}."
+            )
+        self.sensor_foot_ids = [sensor_id_by_prefix[prefix] for prefix in foot_prefixes]
+        self.num_feet = len(self.foot_ids)
+        # Filled lazily on the first reward call, after startup mass
+        # randomization has completed.
+        self.body_masses: torch.Tensor | None = None
+        self.total_mass: torch.Tensor | None = None
+
+    def _refresh_body_masses(self) -> None:
+        """Cache masses, including any startup mass randomization."""
+        self.body_masses = self.asset.root_physx_view.get_masses().to(self.asset.device)
+        self.total_mass = self.body_masses.sum(dim=1, keepdim=True).clamp_min(1.0e-6)
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        sensor_cfg: SceneEntityCfg,
+        asset_cfg: SceneEntityCfg,
+        stance_time: float,
+        contact_threshold: float = 1.0,
+    ) -> torch.Tensor:
+        if self.body_masses is None:
+            self._refresh_body_masses()
+
+        # Express actual feet and the points directly below their hips in the
+        # yaw-aligned body frame. Projection to the ground does not change xy.
+        root_pos_w = self.asset.data.root_pos_w.unsqueeze(1)
+        yaw_w = yaw_quat(self.asset.data.root_quat_w)
+        yaw_feet = yaw_w.unsqueeze(1).expand(-1, self.num_feet, -1).reshape(-1, 4)
+
+        foot_pos_rel_w = self.asset.data.body_pos_w[:, self.foot_ids, :] - root_pos_w
+        hip_pos_rel_w = self.asset.data.body_pos_w[:, self.hip_ids, :] - root_pos_w
+        num_envs = self.asset.num_instances
+        foot_xy_b = quat_rotate_inverse(yaw_feet, foot_pos_rel_w.reshape(-1, 3)).view(
+            num_envs, self.num_feet, 3
+        )[..., :2]
+        hip_ground_xy_b = quat_rotate_inverse(yaw_feet, hip_pos_rel_w.reshape(-1, 3)).view(
+            num_envs, self.num_feet, 3
+        )[..., :2]
+
+        # Use the mass-weighted velocity of the complete robot for v_com.
+        com_vel_w = torch.sum(
+            self.asset.data.body_com_lin_vel_w * self.body_masses.unsqueeze(-1), dim=1
+        )
+        com_vel_b = quat_rotate_inverse(yaw_w, com_vel_w / self.total_mass)[..., :2]
+        desired_landing_xy_b = hip_ground_xy_b + 0.5 * self.stance_time * com_vel_b.unsqueeze(1)
+
+        contact_force = torch.norm(
+            self.contact_sensor.data.net_forces_w[:, self.sensor_foot_ids, :], dim=-1
+        )
+        swing_mask = contact_force <= self.contact_threshold
+        healthy_mask = _get_faulty_leg_mask(self.asset, self.foot_names) < 0.5
+
+        placement_error = torch.sum(torch.square(foot_xy_b - desired_landing_xy_b), dim=-1)
+        return torch.sum(placement_error * swing_mask * healthy_mask, dim=1)
+
+
+def raibert_foot_placement_reward_approximation(
     env: ManagerBasedRLEnv,
     command_name: str,
     asset_cfg: SceneEntityCfg,
@@ -493,7 +847,7 @@ def raibert_foot_placement_reward(
     nominal_foot_positions_xy: list[list[float]],
     vel_gain: float = 0.0,
 ) -> torch.Tensor:
-    """Penalize foot xy placement error against a Raibert-style desired foothold.
+    """Legacy phase-free approximation retained for reference; currently unused.
 
     The desired foothold is defined in the yaw-aligned body frame as:
 

@@ -697,8 +697,19 @@ class PPODreamFLEX(PPO):
             decode_target.requires_grad = False   
             beta = 1.   
                   
-            encoder_loss = (nn.MSELoss()(code_vel,vel_target) + nn.MSELoss()(decode,decode_target) \
-                            + beta*(-0.5 * torch.mean(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp())))
+            # Standard beta-VAE reduction: sum the KL contribution across
+            # latent dimensions for each sample, then average across samples.
+            kl_loss = -0.5 * torch.mean(
+                torch.sum(
+                    1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp(),
+                    dim=-1,
+                )
+            )
+            encoder_loss = (
+                nn.MSELoss()(code_vel, vel_target)
+                + nn.MSELoss()(decode, decode_target)
+                + beta * kl_loss
+            )
             # if encoder_loss.item() > 1e3:
             #     breakpoint()
             # Fault loss
@@ -1239,10 +1250,22 @@ class PPOGCN(PPO):
         extras: tuple,
         fault_target: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the optimization loss and supervised fault loss for GCNActor."""
-        _, fault_logits, _ = extras
+        """Supervise joint faults and suppress unnecessary FiLM corrections."""
+        fault_logits, film = extras
         fault_loss = nn.BCEWithLogitsLoss()(fault_logits, fault_target)
-        return fault_loss, fault_loss
+        if film is None:
+            return fault_loss, fault_loss
+
+        gamma, beta = film
+        film_energy = gamma.square().mean(dim=-1) + beta.square().mean(dim=-1)
+        healthy_mask = ~fault_target.bool().any(dim=-1)
+        if healthy_mask.any():
+            healthy_film_loss = film_energy[healthy_mask].mean()
+        else:
+            healthy_film_loss = film_energy.new_zeros(())
+        film_reg_loss = film_energy.mean()
+        auxiliary_loss = fault_loss + 0.1 * healthy_film_loss + 1.0e-4 * film_reg_loss
+        return auxiliary_loss, fault_loss
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPOFTNet:
@@ -1279,6 +1302,25 @@ class PPOGCN(PPO):
 
         # Resolve symmetry config if used
         cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
+
+        # GCNTemporalEncoder relies on a fixed correspondence between history
+        # slices, graph nodes, actions, and fault targets. Fail early instead
+        # of silently attaching a physical joint to the wrong node.
+        expected_joint_order = tuple(GCNActor.expected_joint_order)
+        base_env = env.unwrapped
+        asset_joint_order = tuple(base_env.scene["robot"].joint_names)
+        if asset_joint_order != expected_joint_order:
+            raise ValueError(
+                "GCNActor joint order mismatch: expected "
+                f"{expected_joint_order}, got {asset_joint_order}."
+            )
+        action_term = base_env.action_manager.get_term("joint_pos")
+        action_joint_order = tuple(action_term._joint_names)
+        if action_joint_order != expected_joint_order:
+            raise ValueError(
+                "GCNActor action order mismatch: expected "
+                f"{expected_joint_order}, got {action_joint_order}."
+            )
 
         # Initialize the policy
         actor: GCNActor = actor_class(obs, env.num_actions, **cfg["actor"]).to(device)
@@ -1354,13 +1396,7 @@ class PPOGCN(PPO):
         mean_surrogate_loss = 0
         mean_entropy = 0
 
-        mean_motors_strength_loss = 0
-        mean_vel_loss = 0
         mean_fault_loss = 0
-        mean_ctr_loss = 0
-        mean_priv_encode_loss = 0
-        mean_scandots_encoder_loss = 0
-        mean_phys_encoder_loss = 0
 
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
@@ -1462,132 +1498,11 @@ class PPOGCN(PPO):
                     # Update the learning rate for all parameter groups
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
-            setup = extras[0]
-            # breakpoint()
-            if setup == 1:
-                def fault_binary_to_class_index(fault_binary: torch.Tensor) -> torch.Tensor:
-                    """Convert [..., 12] binary fault labels to [...] class indices.
-
-                    Classes 0-11: faulty joint index
-                    Class 12: no fault
-                    """
-                    has_fault = fault_binary.any(dim=-1)
-                    class_idx = fault_binary.float().argmax(dim=-1)
-                    class_idx = torch.where(has_fault, class_idx, torch.full_like(class_idx, 12))
-                    return class_idx.long()
-                # Encoder loss
-                # breakpoint()
-                # pred_vel, fault_logits, code_latent, mean_latent, logvar_latent, code_phys, code_terrain, pred_height_map = extras
-                # _, scandots_pred, scandots_code, mean_scandots_code, logvar_scandots_code, fault_logits, gcn_code = extras
-                # vel_target = batch.observations['critic'][:,-32:-29]
-                fault_label_target = batch.observations['critic'][:,-12:]
-                # fault_class_target = fault_binary_to_class_index(fault_label_target)
-                # decode_target = batch.next_observations['policy']
-                # scandots_target = batch.observations['critic'][:,48:48+187]
-                # motors_strength_target = batch.observations['critic'][:,-24:-12]
-
-                # scandots_target.requires_grad = False
-                # fault_label_target.requires_grad = False
-                # fault_class_target.requires_grad = False
-                
-                # motors_strength_target.requires_grad = False
-
-                # beta = 1.
-                # scandots_encoder_loss = (scandots_error**2).mean()
-                # scandots_encoder_loss += beta*(-0.5 * torch.mean(1 + logvar_scandots_code - mean_scandots_code.pow(2) - logvar_scandots_code.exp()))
-                fault_auxiliary_loss, fault_loss = self._compute_fault_auxiliary_loss(
-                    extras, fault_label_target
-                )
-                scandots_encoder_loss = fault_loss.new_zeros(())
-                # Fault loss
-                # breakpoint()
-                # fault_loss = nn.CrossEntropyLoss()(fault_logits, fault_class_target)
-                # motors_strength_loss = nn.MSELoss()(motors_strength, motors_strength_target)
-                # print((torch.sigmoid(fault_logits) < 0.5).float().mean())
-                # ((torch.sigmoid(fault_logits) > 0.5) == fault_label_target).float().mean()
-                # breakpoint()
-                # if fault_loss.item() > 0.15:
-                #     breakpoint()
-                # breakpoint()
-                # loss += vel_loss + vae_kl_loss + vae_recon_loss + disentangle_loss + fault_loss 
-                # loss += scandots_encoder_loss + fault_loss
-                # loss += motors_strength_loss + fault_loss
-                loss += fault_auxiliary_loss
-                motors_strength_loss = fault_loss.new_zeros(())
-                phys_encoder_loss = fault_loss.new_zeros(())
-            elif setup == 2:
-                _ , priv_phys_z, priv_scandots_z, hist_to_scandots_z, gcn_z = extras
-                scandots_encoder_loss = nn.MSELoss()(priv_phys_z, gcn_z)
-                phys_encoder_loss = nn.MSELoss()(priv_scandots_z, hist_to_scandots_z)
-                loss += scandots_encoder_loss + phys_encoder_loss 
-                # _, priv_scan_z, hist_scan_z, gcn_z = extras
-                # fault_label = batch.observations['critic'][:,-12:]
-
-                # def fault_supcon_loss_chunked(gcn_z, fault_label, temperature=0.1, chunk_size=256):
-                #     """
-                #     gcn_z: [N, D]
-                #     fault_label: [N, 12] binary {0,1}
-                #     Exact supervised contrastive loss with exact-match positives,
-                #     computed in chunks to avoid O(N^2) memory.
-                #     """
-                #     device = gcn_z.device
-                #     N = gcn_z.size(0)
-
-                #     z = torch.nn.functional.normalize(gcn_z, dim=1)
-
-                #     # Convert each 12-bit fault vector into one class id in [0, 4095]
-                #     bits = (2 ** torch.arange(fault_label.size(1), device=device)).long()
-                #     class_id = (fault_label.long() * bits).sum(dim=1)  # [N]
-
-                #     total_loss = z.new_tensor(0.0)
-                #     total_count = 0
-
-                #     for start in range(0, N, chunk_size):
-                #         end = min(start + chunk_size, N)
-                #         bsz = end - start
-
-                #         z_i = z[start:end]                          # [B, D]
-                #         cls_i = class_id[start:end]                # [B]
-
-                #         # Similarity of chunk anchors against all samples
-                #         logits = torch.matmul(z_i, z.T) / temperature   # [B, N]
-
-                #         # Positive mask: same fault pattern
-                #         pos_mask = (cls_i[:, None] == class_id[None, :])  # [B, N]
-
-                #         # Remove self-comparisons
-                #         row_idx = torch.arange(bsz, device=device)
-                #         col_idx = torch.arange(start, end, device=device)
-                #         logits[row_idx, col_idx] = float("-inf")
-                #         pos_mask[row_idx, col_idx] = False
-
-                #         pos_count = pos_mask.sum(dim=1)  # [B]
-                #         valid = pos_count > 0
-                #         if not valid.any():
-                #             continue
-
-                #         log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-
-                #         mean_log_prob_pos = (log_prob * pos_mask).sum(dim=1) / pos_count.clamp_min(1)
-                #         loss_i = -mean_log_prob_pos[valid].sum()
-
-                #         total_loss += loss_i
-                #         total_count += valid.sum().item()
-
-                #     if total_count == 0:
-                #         return z.new_tensor(0.0, requires_grad=True)
-
-                #     return total_loss / total_count
-                # # breakpoint()
-                # ctr_loss = fault_supcon_loss_chunked(
-                #             gcn_z,
-                #             fault_label,
-                #             temperature=0.1,
-                #             chunk_size=128,   # try 128 or 256
-                #         )
-                # priv_encode_loss = nn.MSELoss()(priv_scan_z, hist_scan_z)
-
-                # loss += ctr_loss + priv_encode_loss 
+            fault_target = batch.observations['critic'][:, -12:]
+            fault_auxiliary_loss, fault_loss = self._compute_fault_auxiliary_loss(
+                extras, fault_target
+            )
+            loss += fault_auxiliary_loss
 
             # Symmetry loss
             if self.symmetry:
@@ -1656,16 +1571,7 @@ class PPOGCN(PPO):
                 self.rnd_optimizer.step()
 
             # Store the losses
-            # mean_vel_loss += vel_loss.item()
-            # mean_vae_kl_loss += vae_kl_loss.item()
-            # mean_vae_recon_loss += vae_recon_loss.item()
-            # mean_disentangle_loss += disentangle_loss.item()
-            mean_motors_strength_loss += motors_strength_loss.item()
             mean_fault_loss += fault_loss.item()
-            # mean_ctr_loss += ctr_loss.item()
-            # mean_priv_encode_loss += priv_encode_loss.item()
-            mean_scandots_encoder_loss += scandots_encoder_loss.item()
-            mean_phys_encoder_loss += phys_encoder_loss.item()
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.mean().item()
@@ -1679,13 +1585,7 @@ class PPOGCN(PPO):
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
 
-        mean_vel_loss /= num_updates
-        # mean_vae_kl_loss /= num_updates
-        # mean_vae_recon_loss /= num_updates
-        # mean_disentangle_loss /= num_updates
         mean_fault_loss /= num_updates
-        mean_ctr_loss /= num_updates
-        mean_priv_encode_loss /= num_updates
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
@@ -1703,18 +1603,7 @@ class PPOGCN(PPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
-        loss_dict.update({
-            # "vel": mean_vel_loss,
-            # "vae_kl": mean_vae_kl_loss,
-            # "vae_recon": mean_vae_recon_loss,
-            # "disentangle": mean_disentangle_loss,
-            # "motor": mean_motors_strength_loss,
-            "fault": mean_fault_loss,
-            # "ctr": mean_ctr_loss,
-            # "priv_encode": mean_priv_encode_loss,
-            "scandots_encoder": mean_scandots_encoder_loss,
-            # "phys_encoder": mean_phys_encoder_loss,
-        })
+        loss_dict["fault"] = mean_fault_loss
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
@@ -1734,30 +1623,94 @@ class PPOEquivGCN(PPOGCN):
         critic: MLPModel,
         storage: RolloutStorage,
         *args,
-        fault_pos_weight: float = 1.0,
+        fault_focal_gamma: float = 2.0,
+        fault_focal_alpha: float = 0.5,
         **kwargs,
     ):
-        if fault_pos_weight <= 0.0:
-            raise ValueError(f"fault_pos_weight must be positive, got {fault_pos_weight}.")
-        self.fault_pos_weight = float(fault_pos_weight)
+        if fault_focal_gamma < 0.0:
+            raise ValueError(
+                f"fault_focal_gamma must be non-negative, got {fault_focal_gamma}."
+            )
+        if not 0.0 <= fault_focal_alpha <= 1.0:
+            raise ValueError(
+                f"fault_focal_alpha must be in [0, 1], got {fault_focal_alpha}."
+            )
+        self.fault_focal_gamma = float(fault_focal_gamma)
+        self.fault_focal_alpha = float(fault_focal_alpha)
         super().__init__(actor, critic, storage, *args, **kwargs)
+
+    def update(self) -> dict[str, float]:
+        """Run PPO update and report micro fault precision/recall."""
+        self._fault_true_positives = 0.0
+        self._fault_false_positives = 0.0
+        self._fault_false_negatives = 0.0
+
+        loss_dict = super().update()
+
+        counts = torch.tensor(
+            (
+                self._fault_true_positives,
+                self._fault_false_positives,
+                self._fault_false_negatives,
+            ),
+            device=self.device,
+            dtype=torch.float64,
+        )
+        if self.is_multi_gpu:
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        true_positives, false_positives, false_negatives = counts.tolist()
+        precision_denominator = true_positives + false_positives
+        recall_denominator = true_positives + false_negatives
+        loss_dict["fault_precision"] = (
+            true_positives / precision_denominator
+            if precision_denominator > 0.0
+            else 0.0
+        )
+        loss_dict["fault_recall"] = (
+            true_positives / recall_denominator
+            if recall_denominator > 0.0
+            else 0.0
+        )
+        return loss_dict
 
     def _compute_fault_auxiliary_loss(
         self,
         extras: tuple,
         fault_target: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Weight the faulty joint and add FiLM regularization."""
+        """Apply sigmoid focal classification loss and FiLM regularization."""
         _, fault_logits, film = extras
         gamma, beta = film
-        pos_weight = fault_logits.new_full(
-            (fault_logits.shape[-1],), self.fault_pos_weight
-        )
-        fault_loss = nn.functional.binary_cross_entropy_with_logits(
+        target = fault_target.to(dtype=fault_logits.dtype)
+        binary_ce = nn.functional.binary_cross_entropy_with_logits(
             fault_logits,
-            fault_target.to(dtype=fault_logits.dtype),
-            pos_weight=pos_weight,
+            target,
+            reduction="none",
         )
+        # exp(-BCE) is p for a positive target and 1-p for a negative target.
+        # This avoids explicitly evaluating log(sigmoid(logits)).
+        probability_true_class = torch.exp(-binary_ce)
+        alpha_t = (
+            self.fault_focal_alpha * target
+            + (1.0 - self.fault_focal_alpha) * (1.0 - target)
+        )
+        focal_weight = alpha_t * (1.0 - probability_true_class).pow(
+            self.fault_focal_gamma
+        )
+        fault_loss = (focal_weight * binary_ce).mean()
+
+        with torch.no_grad():
+            predicted_fault = fault_logits >= 0.0
+            target_fault = fault_target.bool()
+            self._fault_true_positives += float(
+                (predicted_fault & target_fault).sum().item()
+            )
+            self._fault_false_positives += float(
+                (predicted_fault & ~target_fault).sum().item()
+            )
+            self._fault_false_negatives += float(
+                (~predicted_fault & target_fault).sum().item()
+            )
 
         film_energy = gamma.square().mean(dim=-1) + beta.square().mean(dim=-1)
         healthy_mask = ~fault_target.bool().any(dim=-1)

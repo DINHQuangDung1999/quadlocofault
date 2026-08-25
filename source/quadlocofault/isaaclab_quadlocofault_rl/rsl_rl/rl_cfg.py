@@ -255,6 +255,15 @@ class RslRlGCNActorCfg:
     obs_normalization: bool = False
     """Whether to normalize the observation for the model. Defaults to False."""
 
+    fault_encoder_type: str = "tcn"
+    """Fault-history encoder used by EquivGCN: ``"tcn"`` or ``"mlp"``."""
+
+    fault_mlp_hidden_dims: tuple[int, ...] | list[int] = (128, 64)
+    """Hidden layers of the optional fault-residual MLP."""
+
+    film_scale: float = 0.5
+    """Maximum magnitude of the bounded residual FiLM parameters."""
+
     distribution_cfg: DistributionCfg | None = None
     """The configuration for the output distribution of Actor. Defaults to None, in which case no distribution is used."""
 
@@ -288,4 +297,3 @@ class RslRlGCNActorCfg:
 
         output_channels: tuple[int] | list[int] = MISSING
         """The number of output channels for each convolutional layer for the CNN."""
-

@@ -28,6 +28,8 @@ def randomize_actuator_faults(
     failure_coef_severe: float | Sequence[float] | torch.Tensor = 0.3,
     failure_coef_moderate: float | Sequence[float] | torch.Tensor = 0.8,
     num_faults: int = 1,
+    fixed_joint_idx: int | None = None,
+    apply_once_per_episode: bool = False,
 ):
     asset: Articulation = env.scene[asset_cfg.name]
 
@@ -57,13 +59,16 @@ def randomize_actuator_faults(
 
     if env_ids is None:
         env_ids = torch.arange(env.scene.num_envs, device=asset.device)
-    if not hasattr(asset, "episode_fault_applied"):
-        asset.episode_fault_applied = torch.zeros(env.scene.num_envs, dtype=torch.bool, device=asset.device)
 
-    # Only randomize faults for environments that have not been faulted in the current episode yet.
-    env_ids = env_ids[~asset.episode_fault_applied[env_ids]]
-    if env_ids.numel() == 0:
-        return
+    if apply_once_per_episode:
+        if not hasattr(asset, "episode_fault_applied"):
+            asset.episode_fault_applied = torch.zeros(
+                env.scene.num_envs, dtype=torch.bool, device=asset.device
+            )
+        # Deployment faults persist for the remainder of the episode.
+        env_ids = env_ids[~asset.episode_fault_applied[env_ids]]
+        if env_ids.numel() == 0:
+            return
     # breakpoint()
     for actuator in asset.actuators.values():
         size = len(asset.joint_names)
@@ -75,7 +80,27 @@ def randomize_actuator_faults(
         u1 = torch.rand((N, num_faults), device=asset.device) * lb_tensor.unsqueeze(1)  # severe failure
         u2 = torch.rand((N, num_faults), device=asset.device) * (ub_tensor - lb_tensor).unsqueeze(1) + lb_tensor.unsqueeze(1)  # moderate failure
         failure_coef = is_severe*u1 + (1-is_severe)*u2
-        faulty_joint_idx = torch.randint(low=0, high=size, size=(N,num_faults), dtype=torch.long, device=asset.device)
+        if fixed_joint_idx is None:
+            faulty_joint_idx = torch.randint(
+                low=0,
+                high=size,
+                size=(N, num_faults),
+                dtype=torch.long,
+                device=asset.device,
+            )
+        else:
+            if num_faults != 1:
+                raise ValueError("fixed_joint_idx requires num_faults=1.")
+            if not 0 <= fixed_joint_idx < size:
+                raise ValueError(
+                    f"fixed_joint_idx must be in [0, {size - 1}], got {fixed_joint_idx}."
+                )
+            faulty_joint_idx = torch.full(
+                (N, 1),
+                fixed_joint_idx,
+                dtype=torch.long,
+                device=asset.device,
+            )
         # if (asset.faulty_joint_idx[env_ids]).sum() > 0:
         #     breakpoint()
         asset.faulty_joint_idx[env_ids] = torch.zeros((env_ids.shape[0],len(asset.joint_names)), dtype=torch.long, device=asset.device)
@@ -86,7 +111,8 @@ def randomize_actuator_faults(
 
         actuator.stiffness[env_ids] = (asset.data.default_joint_stiffness * asset.motors_strength)[env_ids].clone()
         actuator.damping[env_ids] = (asset.data.default_joint_damping * asset.motors_strength)[env_ids].clone()
-    asset.episode_fault_applied[env_ids] = True
+    if apply_once_per_episode:
+        asset.episode_fault_applied[env_ids] = True
 
 def reset_actuator_gains(
     env: ManagerBasedEnv,
@@ -116,7 +142,7 @@ def reset_actuator_gains(
         else: # initialize fault idx
             asset.faulty_joint_idx = torch.zeros_like(asset.default_motors_strength, dtype=torch.long, device=asset.device)
 
+        # This attribute is created only by deployment/play configurations
+        # that opt into apply_once_per_episode.
         if hasattr(asset, "episode_fault_applied"):
             asset.episode_fault_applied[env_ids] = False
-        else:
-            asset.episode_fault_applied = torch.zeros(env.scene.num_envs, dtype=torch.bool, device=asset.device)

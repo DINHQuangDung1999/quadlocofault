@@ -18,17 +18,21 @@
 #     --task FTNet-Isaac-Velocity-Rough-Unitree-Go2-v0 \
 #     --headless \
 #     --num_envs 4096 \
-#     --max_iterations 4000 \
+#     --max_iterations 2000 \
+#     --seed 1 \
+#     --run_name ftnetrewards_norewclip_seed1
     # --resume \
     # --load_run wave_no \
     # --checkpoint model_1999.pt \
     # --max_iterations 1000
 
-python scripts/quadlocofault_rsl_rl/train.py \
-    --task FLEX-Isaac-Velocity-Rough-Unitree-Go2-v0 \
-    --headless \
-    --num_envs 4096 \
-    --max_iterations 4000 \
+# python scripts/quadlocofault_rsl_rl/train.py \
+#     --task FLEX-Isaac-Velocity-Rough-Unitree-Go2-v0 \
+#     --headless \
+#     --num_envs 4096 \
+#     --max_iterations 2000 \
+#     --seed 1 \
+#     --run_name flexrewards_norewclip_seed1
     # --resume \
     # --load_run new_rewards \
     # --checkpoint model_999.pt \
@@ -48,7 +52,17 @@ python scripts/quadlocofault_rsl_rl/train.py \
 #     --task EquivGCN-Isaac-Velocity-Rough-Unitree-Go2-v0 \
 #     --headless \
 #     --num_envs 4096 \
-#     --max_iterations 4000
+#     --max_iterations 3000 \
+#     --seed 1 \
+#     --run_name gcnrewards_seed1
     # --resume \
     # --load_run 2026-07-27_00-18-28 \
     # --checkpoint model_1000.pt 
+
+python scripts/quadlocofault_rsl_rl/train.py \
+    --task EquivGCNMLP-Isaac-Velocity-Rough-Unitree-Go2-v0 \
+    --headless \
+    --num_envs 4096 \
+    --max_iterations 2000 \
+    --seed 1 \
+    --run_name gcnrewards_norewclip_take3_seed1
