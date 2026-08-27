@@ -78,7 +78,12 @@ def _configure_play(cfg) -> None:
         terrain_generator.num_rows = 5
         terrain_generator.num_cols = 5
         terrain_generator.curriculum = False
-        terrain_generator.difficulty_range = (0.5, 0.5)
+        # Visualize every terrain at its maximum configured severity. Stairs are
+        # capped separately because the shared training configuration permits
+        # step heights up to 0.23 m, which is disproportionately difficult.
+        terrain_generator.difficulty_range = (0.6,0.6)
+        # terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.05, 0.15)
+        # terrain_generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.05, 0.15)
 
     cfg.observations.policy.enable_corruption = False
     cfg.observations.history.enable_corruption = False
@@ -86,7 +91,7 @@ def _configure_play(cfg) -> None:
     cfg.curriculum.actuator_faults = None
     cfg.terminations.base_contact.params["sensor_cfg"].body_names = [
         "base",
-        "Head.*",
+        # "Head.*",
     ]
 
 

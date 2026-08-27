@@ -646,7 +646,7 @@ class DreamFLEXRewardsCfg:
         func=mdp.base_height_l2,
         weight=-1.0,
         params={
-            "target_height": 0.30,
+            "target_height": 0.32,
             "asset_cfg": SceneEntityCfg("robot"),
             "sensor_cfg": SceneEntityCfg("height_scanner"),
         },
@@ -833,7 +833,7 @@ class LocomotionVelocityRoughEnvCfg(ManagerBasedRLEnvCfg):
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
     only_positive_rewards: bool = False
-    # ### Behind and above
+    ### Behind and above
     viewer = ViewerCfg(
         eye=(-2.0, -2.0, 1.0),
         lookat=(0.0, 0.0, 0.3),
@@ -905,7 +905,7 @@ class LocomotionVelocityRoughEnvCfg(ManagerBasedRLEnvCfg):
 @configclass
 class LocomotionVelocityRoughFTNetEnvCfg(LocomotionVelocityRoughEnvCfg):
     observations = FTNetObservationsCfg()
-    rewards = FTNetRewardsCfg()
+    rewards = DreamFLEXRewardsCfg()
     only_positive_rewards = False
 
 @configclass
@@ -924,8 +924,8 @@ class LocomotionVelocityRoughFLEXEnvCfg(LocomotionVelocityRoughEnvCfg):
 
 @configclass
 class LocomotionVelocityRoughGCNEnvCfg(LocomotionVelocityRoughEnvCfg):
-    rewards = RewardsCfg()
-    # only_positive_rewards = True
+    rewards = DreamFLEXRewardsCfg()
+    only_positive_rewards = False
 
 @configclass
 class LocomotionVelocityRoughOracleEnvCfg(LocomotionVelocityRoughEnvCfg):

@@ -131,6 +131,15 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--batch_fault_joints",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=(
+        "Evaluate --fault_joints concurrently. --num_envs is interpreted as "
+        "the number of environments per joint."
+    ),
+)
+parser.add_argument(
     "--eval_seeds",
     nargs="+",
     type=int,
@@ -139,6 +148,12 @@ parser.add_argument(
 )
 parser.add_argument("--terrain_difficulty_min", type=float, default=0.5)
 parser.add_argument("--terrain_difficulty_max", type=float, default=0.7)
+parser.add_argument(
+    "--stair_step_height_max",
+    type=float,
+    default=None,
+    help="Optional maximum step height in metres for both stair terrain directions.",
+)
 parser.add_argument("--contact_threshold", type=float, default=1.0)
 parser.add_argument("--plot_env_id", type=int, default=0)
 parser.add_argument(
@@ -175,6 +190,13 @@ parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
 parser.add_argument("--model", choices=MODELS, default=None, help=argparse.SUPPRESS)
 parser.add_argument("--terrain", choices=tuple(TERRAINS), default=None, help=argparse.SUPPRESS)
 parser.add_argument("--fault_coef", type=float, default=None, help=argparse.SUPPRESS)
+parser.add_argument(
+    "--worker_fault_joints",
+    nargs="+",
+    choices=JOINT_NAMES,
+    default=None,
+    help=argparse.SUPPRESS,
+)
 parser.add_argument("--result_json", type=str, default=None, help=argparse.SUPPRESS)
 parser.add_argument("--task", type=str, default=None, help=argparse.SUPPRESS)
 parser.add_argument(
@@ -281,10 +303,34 @@ def _matches_saved_run(row: dict, checkpoint: Path, num_envs: int) -> bool:
     saved_checkpoint = row.get("checkpoint")
     if not saved_checkpoint:
         return False
-    return (
+    common_match = (
         Path(saved_checkpoint).expanduser().resolve() == checkpoint.resolve()
         and saved_num_envs == num_envs
     )
+    if not common_match:
+        return False
+    # Do not silently reuse rows produced by an older benchmark protocol.
+    required_values = {
+        "terrain_difficulty_min": args_cli.terrain_difficulty_min,
+        "terrain_difficulty_max": args_cli.terrain_difficulty_max,
+        "stair_step_height_max_m": args_cli.stair_step_height_max,
+        "success_distance_m": args_cli.success_distance,
+        "success_confirmation_time_s": args_cli.success_confirmation_time,
+        "horizon_s": args_cli.rough_duration,
+        "initial_xy_range_m": 0.5,
+        "initial_yaw_range_rad": math.pi,
+    }
+    for key, expected in required_values.items():
+        saved = row.get(key)
+        if saved in (None, "") or expected is None:
+            if saved not in (None, "") or expected is not None:
+                return False
+            continue
+        if not math.isclose(float(saved), float(expected), rel_tol=0.0, abs_tol=1.0e-9):
+            return False
+    if row.get("progress_frame") != "initial_heading":
+        return False
+    return True
 
 
 def _persist_result(output_dir: Path, protocol: str, row: dict) -> None:
@@ -308,6 +354,8 @@ def _worker_command(
     checkpoint: Path,
     terrain: str | None = None,
     fault_joint: str | None = None,
+    fault_joints: list[str] | None = None,
+    worker_num_envs: int | None = None,
     seed: int = 0,
 ) -> list[str]:
     """Build a worker invocation while retaining launcher/device arguments."""
@@ -337,6 +385,10 @@ def _worker_command(
         command.extend(("--terrain", terrain))
     if fault_joint is not None:
         command.extend(("--fault_joint", fault_joint))
+    if fault_joints is not None:
+        command.extend(("--worker_fault_joints", *fault_joints))
+    if worker_num_envs is not None:
+        command.extend(("--num_envs", str(worker_num_envs)))
     return command
 
 
@@ -353,6 +405,8 @@ def _run_parent() -> int:
         raise ValueError("--success_distance_margin must be non-negative.")
     if args_cli.success_confirmation_time < 0.0:
         raise ValueError("--success_confirmation_time must be non-negative.")
+    if args_cli.stair_step_height_max is not None and args_cli.stair_step_height_max <= 0.05:
+        raise ValueError("--stair_step_height_max must be greater than the 0.05 m minimum.")
     if not 0.0 <= args_cli.fault_time < args_cli.flat_duration:
         raise ValueError("--fault_time must be within the flat evaluation episode.")
 
@@ -367,6 +421,15 @@ def _run_parent() -> int:
         args_cli.fault_joints
         if args_cli.fault_joints is not None
         else [args_cli.fault_joint]
+    )
+    if args_cli.batch_fault_joints and args_cli.fault_joints is None:
+        raise ValueError("--batch_fault_joints requires --fault_joints.")
+    if args_cli.batch_fault_joints and args_cli.protocol != "rough":
+        raise ValueError("--batch_fault_joints currently supports --protocol rough only.")
+    joint_batches = (
+        [list(selected_joints)]
+        if args_cli.batch_fault_joints
+        else [[joint] for joint in selected_joints]
     )
     selected_seeds = (
         args_cli.eval_seeds
@@ -390,22 +453,33 @@ def _run_parent() -> int:
                     if protocol == "rough"
                     else (None,)
                 )
-                for fault_joint in selected_joints:
-                    joint_label = fault_joint or "random_joint"
+                for fault_batch in joint_batches:
+                    batched = len(fault_batch) > 1
+                    joint_label = (
+                        "balanced_joints"
+                        if batched
+                        else (fault_batch[0] or "random_joint")
+                    )
                     for seed in selected_seeds:
                         for terrain in terrain_names:
                             for fault_coef in FAULT_COEFFICIENTS:
-                                case = {
-                                    "model": model,
-                                    "terrain": terrain or "flat",
-                                    "fault_coefficient": fault_coef,
-                                    "fault_joint": fault_joint,
-                                    "seed": seed,
-                                }
-                                already_saved = any(
-                                    _case_key(row) == _case_key(case)
-                                    and _matches_saved_run(row, checkpoint, args_cli.num_envs)
-                                    for row in saved_rows[protocol]
+                                cases = [
+                                    {
+                                        "model": model,
+                                        "terrain": terrain or "flat",
+                                        "fault_coefficient": fault_coef,
+                                        "fault_joint": fault_joint,
+                                        "seed": seed,
+                                    }
+                                    for fault_joint in fault_batch
+                                ]
+                                already_saved = all(
+                                    any(
+                                        _case_key(row) == _case_key(case)
+                                        and _matches_saved_run(row, checkpoint, args_cli.num_envs)
+                                        for row in saved_rows[protocol]
+                                    )
+                                    for case in cases
                                 )
                                 if args_cli.resume_eval and already_saved:
                                     print(
@@ -426,7 +500,13 @@ def _run_parent() -> int:
                                         protocol=protocol,
                                         terrain=terrain,
                                         fault_coef=fault_coef,
-                                        fault_joint=fault_joint,
+                                        fault_joint=None if batched else fault_batch[0],
+                                        fault_joints=fault_batch if batched else None,
+                                        worker_num_envs=(
+                                            args_cli.num_envs * len(fault_batch)
+                                            if batched
+                                            else None
+                                        ),
                                         seed=seed,
                                         result_json=result_json,
                                         output_dir=output_dir,
@@ -442,10 +522,18 @@ def _run_parent() -> int:
                                         file=sys.stderr,
                                     )
                                     return 1
-                                row = json.loads(result_json.read_text(encoding="utf-8"))
-                                results[protocol].append(row)
-                                saved_rows[protocol].append(row)
-                                _persist_result(output_dir, protocol, row)
+                                worker_result = json.loads(
+                                    result_json.read_text(encoding="utf-8")
+                                )
+                                rows = (
+                                    worker_result
+                                    if isinstance(worker_result, list)
+                                    else [worker_result]
+                                )
+                                for row in rows:
+                                    results[protocol].append(row)
+                                    saved_rows[protocol].append(row)
+                                    _persist_result(output_dir, protocol, row)
 
     if results["rough"]:
         _write_csv(output_dir / "rough_locomotion_lifetime.csv", results["rough"])
@@ -514,9 +602,9 @@ def _run_worker() -> int:
         env_cfg.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
         env_cfg.events.reset_base.params = {
             "pose_range": {
-                "x": (0.0, 0.0),
-                "y": (0.0, 0.0),
-                "yaw": (0.0, 0.0),
+                "x": (-0.5, 0.5),
+                "y": (-0.5, 0.5),
+                "yaw": (-math.pi, math.pi),
             },
             "velocity_range": {
                 axis: (0.0, 0.0)
@@ -535,17 +623,31 @@ def _run_worker() -> int:
         # both moderate bounds to coef and severe probability to zero makes the
         # benchmark coefficient exact rather than random.
         fault_event = env_cfg.events.randomize_actuator_faults
-        fixed_joint_idx = (
-            JOINT_NAMES.index(args_cli.fault_joint)
-            if args_cli.fault_joint is not None
-            else None
-        )
+        if args_cli.worker_fault_joints is not None:
+            if env_cfg.scene.num_envs % len(args_cli.worker_fault_joints) != 0:
+                raise ValueError(
+                    "The worker environment count must be divisible by the number "
+                    "of batched fault joints."
+                )
+            envs_per_joint = env_cfg.scene.num_envs // len(args_cli.worker_fault_joints)
+            fixed_joint_idx = [
+                JOINT_NAMES.index(joint_name)
+                for joint_name in args_cli.worker_fault_joints
+                for _ in range(envs_per_joint)
+            ]
+        else:
+            fixed_joint_idx = (
+                JOINT_NAMES.index(args_cli.fault_joint)
+                if args_cli.fault_joint is not None
+                else None
+            )
         fault_event.params.update(
             severe_fault_prob=0.0,
             failure_coef_severe=float(args_cli.fault_coef),
             failure_coef_moderate=float(args_cli.fault_coef),
             num_faults=1,
             fixed_joint_idx=fixed_joint_idx,
+            apply_once_per_episode=False,
         )
 
     def configure_rough(env_cfg) -> None:
@@ -557,9 +659,11 @@ def _run_worker() -> int:
             args_cli.rough_duration + 1.0,
         )
 
-        # fault_event = env_cfg.events.randomize_actuator_faults
-        # fault_event.mode = "reset"
-        # fault_event.interval_range_s = None
+        # Apply one persistent fault during reset so the entire measured
+        # traversal takes place under the requested fault condition.
+        fault_event = env_cfg.events.randomize_actuator_faults
+        fault_event.mode = "reset"
+        fault_event.interval_range_s = None
 
         generator = env_cfg.scene.terrain.terrain_generator
         generator.curriculum = False
@@ -567,6 +671,15 @@ def _run_worker() -> int:
             args_cli.terrain_difficulty_min,
             args_cli.terrain_difficulty_max,
         )
+        if args_cli.stair_step_height_max is not None:
+            generator.sub_terrains["pyramid_stairs"].step_height_range = (
+                0.05,
+                args_cli.stair_step_height_max,
+            )
+            generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (
+                0.05,
+                args_cli.stair_step_height_max,
+            )
         env_cfg.scene.terrain.max_init_terrain_level = None
         for subterrain in generator.sub_terrains.values():
             subterrain.proportion = 0.0
@@ -636,26 +749,35 @@ def _run_worker() -> int:
         finished = torch.zeros(
             env.num_envs, dtype=torch.bool, device=base_env.device
         )
+        collision_finished = torch.zeros_like(finished)
+        orientation_finished = torch.zeros_like(finished)
         reached_target = torch.zeros_like(finished)
         success = torch.zeros_like(finished)
         confirmation_count = torch.zeros(
             env.num_envs, dtype=torch.long, device=base_env.device
         )
         robot = base_env.scene["robot"]
-        initial_x = robot.data.root_pos_w[:, 0].clone()
+        initial_xy = robot.data.root_pos_w[:, :2].clone()
+        initial_heading = robot.data.heading_w.clone()
+        initial_forward_xy = torch.stack(
+            (torch.cos(initial_heading), torch.sin(initial_heading)), dim=1
+        )
         max_forward_progress = torch.zeros(
             env.num_envs, dtype=torch.float, device=base_env.device
         )
-        total_abs_vx_error = torch.tensor(0.0, device=base_env.device)
-        total_abs_xy_error = torch.tensor(0.0, device=base_env.device)
-        total_ate_samples = 0
+        abs_vx_error_sum = torch.zeros(env.num_envs, device=base_env.device)
+        abs_xy_error_sum = torch.zeros(env.num_envs, device=base_env.device)
+        ate_sample_count = torch.zeros(
+            env.num_envs, dtype=torch.long, device=base_env.device
+        )
         obs = env.get_observations()
         with torch.inference_mode():
             for step in range(max_steps):
                 # Save first-episode progress before env.step(), since Isaac Lab
                 # automatically resets terminated environments inside that call.
                 active_before_step = ~finished
-                forward_progress = robot.data.root_pos_w[:, 0] - initial_x
+                displacement_xy = robot.data.root_pos_w[:, :2] - initial_xy
+                forward_progress = torch.sum(displacement_xy * initial_forward_xy, dim=1)
                 max_forward_progress[active_before_step] = torch.maximum(
                     max_forward_progress[active_before_step],
                     forward_progress[active_before_step],
@@ -668,19 +790,24 @@ def _run_worker() -> int:
                 # A time-out at the requested horizon is censoring, not a
                 # locomotion failure. Only physical termination ends lifetime.
                 terminated = base_env.reset_terminated.bool()
+                timed_out = base_env.reset_time_outs.bool()
+                base_contact = base_env.termination_manager.get_term("base_contact").bool()
+                bad_orientation = base_env.termination_manager.get_term("bad_orientation").bool()
 
                 # Isaac Lab resets terminated environments during env.step().
                 # Exclude those reset observations from first-episode ATE.
-                valid_ate = active_before_step & ~terminated
+                valid_ate = active_before_step & ~terminated & ~timed_out
                 if valid_ate.any():
                     command = base_env.command_manager.get_command("base_velocity")
                     measured_xy = base_env.scene["robot"].data.root_lin_vel_b[:, :2]
                     velocity_error = command[:, :2] - measured_xy
-                    total_abs_vx_error += torch.abs(velocity_error[valid_ate, 0]).sum()
-                    total_abs_xy_error += torch.linalg.vector_norm(
+                    abs_vx_error_sum[valid_ate] += torch.abs(
+                        velocity_error[valid_ate, 0]
+                    )
+                    abs_xy_error_sum[valid_ate] += torch.linalg.vector_norm(
                         velocity_error[valid_ate], dim=1
-                    ).sum()
-                    total_ate_samples += int(valid_ate.sum().item())
+                    )
+                    ate_sample_count[valid_ate] += 1
 
                 # Reaching the target on a step that ends in termination does
                 # not count. A successful traversal must then remain alive for
@@ -695,44 +822,95 @@ def _run_worker() -> int:
                 success |= confirming & (confirmation_count >= confirmation_steps)
 
                 newly_finished = terminated & ~finished
+                collision_finished |= newly_finished & base_contact
+                orientation_finished |= newly_finished & bad_orientation
                 lifetime[newly_finished] = (step + 1) * dt
                 finished |= newly_finished
                 reset_policy(policy, policy_module, dones)
                 if finished.all():
                     break
 
-        return {
-            "model": args_cli.model,
-            "terrain": args_cli.terrain,
-            "terrain_cfg": TERRAINS[args_cli.terrain],
-            "fault_coefficient": float(args_cli.fault_coef),
-            "fault_joint": args_cli.fault_joint,
-            "seed": int(args_cli.seed),
-            "fault_time_s": 0.0,
-            "command_vx_mps": 0.5,
-            "num_envs": env.num_envs,
-            "horizon_s": max_steps * dt,
-            "success_distance_m": float(success_distance),
-            "success_confirmation_time_s": float(args_cli.success_confirmation_time),
-            "distance_success_rate": float(success.float().mean().item()),
-            "num_distance_successes": int(success.sum().item()),
-            "mean_max_forward_progress_m": float(max_forward_progress.mean().item()),
-            "median_max_forward_progress_m": float(max_forward_progress.median().item()),
-            "ate_vx_mps": float(
-                (total_abs_vx_error / max(total_ate_samples, 1)).item()
-            ),
-            "ate_xy_mps": float(
-                (total_abs_xy_error / max(total_ate_samples, 1)).item()
-            ),
-            "num_ate_samples": total_ate_samples,
-            "mean_locomotion_time_s": float(lifetime.mean().item()),
-            "std_locomotion_time_s": float(lifetime.std(unbiased=False).item()),
-            "median_locomotion_time_s": float(lifetime.median().item()),
-            "min_locomotion_time_s": float(lifetime.min().item()),
-            "survival_to_horizon": float((~finished).float().mean().item()),
-            "num_resets_before_horizon": int(finished.sum().item()),
-            "checkpoint": str(Path(args_cli.checkpoint).resolve()),
-        }
+        def result_for_group(group_mask: torch.Tensor, fault_joint: str | None) -> dict:
+            group_ate_samples = int(ate_sample_count[group_mask].sum().item())
+            group_abs_vx_error = abs_vx_error_sum[group_mask].sum()
+            group_abs_xy_error = abs_xy_error_sum[group_mask].sum()
+            mean_abs_vx_error = float(
+                (group_abs_vx_error / max(group_ate_samples, 1)).item()
+            )
+            return {
+                "model": args_cli.model,
+                "terrain": args_cli.terrain,
+                "terrain_cfg": TERRAINS[args_cli.terrain],
+                "fault_coefficient": float(args_cli.fault_coef),
+                "fault_joint": fault_joint,
+                "seed": int(args_cli.seed),
+                "fault_time_s": 0.0,
+                "command_vx_mps": 0.5,
+                "num_envs": int(group_mask.sum().item()),
+                "horizon_s": max_steps * dt,
+                "success_distance_m": float(success_distance),
+                "success_confirmation_time_s": float(args_cli.success_confirmation_time),
+                "terrain_difficulty_min": float(args_cli.terrain_difficulty_min),
+                "terrain_difficulty_max": float(args_cli.terrain_difficulty_max),
+                "stair_step_height_max_m": args_cli.stair_step_height_max,
+                "initial_xy_range_m": 0.5,
+                "initial_yaw_range_rad": math.pi,
+                "progress_frame": "initial_heading",
+                "flex_history_length": (
+                    args_cli.flex_history_length if args_cli.model == "FLEX" else None
+                ),
+                "distance_success_rate": float(success[group_mask].float().mean().item()),
+                "num_distance_successes": int(success[group_mask].sum().item()),
+                "mean_max_forward_progress_m": float(
+                    max_forward_progress[group_mask].mean().item()
+                ),
+                "median_max_forward_progress_m": float(
+                    max_forward_progress[group_mask].median().item()
+                ),
+                "ate_vx_mps": mean_abs_vx_error,
+                "mean_abs_vx_tracking_error_mps": mean_abs_vx_error,
+                "ate_xy_mps": float(
+                    (group_abs_xy_error / max(group_ate_samples, 1)).item()
+                ),
+                "num_ate_samples": group_ate_samples,
+                "mean_locomotion_time_s": float(lifetime[group_mask].mean().item()),
+                "std_locomotion_time_s": float(
+                    lifetime[group_mask].std(unbiased=False).item()
+                ),
+                "median_locomotion_time_s": float(lifetime[group_mask].median().item()),
+                "min_locomotion_time_s": float(lifetime[group_mask].min().item()),
+                "survival_to_horizon": float((~finished[group_mask]).float().mean().item()),
+                "timeout_rate": float((~finished[group_mask]).float().mean().item()),
+                "collision_rate": float(
+                    collision_finished[group_mask].float().mean().item()
+                ),
+                "bad_orientation_rate": float(
+                    orientation_finished[group_mask].float().mean().item()
+                ),
+                "num_collision_terminations": int(
+                    collision_finished[group_mask].sum().item()
+                ),
+                "num_bad_orientation_terminations": int(
+                    orientation_finished[group_mask].sum().item()
+                ),
+                "num_resets_before_horizon": int(finished[group_mask].sum().item()),
+                "checkpoint": str(Path(args_cli.checkpoint).resolve()),
+            }
+
+        if args_cli.worker_fault_joints is None:
+            all_envs = torch.ones(env.num_envs, dtype=torch.bool, device=base_env.device)
+            return result_for_group(all_envs, args_cli.fault_joint)
+
+        envs_per_joint = env.num_envs // len(args_cli.worker_fault_joints)
+        results = []
+        for joint_index, joint_name in enumerate(args_cli.worker_fault_joints):
+            group_mask = torch.zeros(
+                env.num_envs, dtype=torch.bool, device=base_env.device
+            )
+            start = joint_index * envs_per_joint
+            group_mask[start : start + envs_per_joint] = True
+            results.append(result_for_group(group_mask, joint_name))
+        return results
 
     def write_contact_plot(
         times: list[float],

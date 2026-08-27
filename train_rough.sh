@@ -14,13 +14,13 @@
 #     --checkpoint model_1000.pt \
 #     --max_iterations 2000
 
-# python scripts/quadlocofault_rsl_rl/train.py \
-#     --task FTNet-Isaac-Velocity-Rough-Unitree-Go2-v0 \
-#     --headless \
-#     --num_envs 4096 \
-#     --max_iterations 2000 \
-#     --seed 1 \
-#     --run_name ftnetrewards_norewclip_seed1
+python scripts/quadlocofault_rsl_rl/train.py \
+    --task FTNet-Isaac-Velocity-Rough-Unitree-Go2-v0 \
+    --headless \
+    --num_envs 4096 \
+    --max_iterations 2000 \
+    --seed 1 \
+    --run_name benchmark_v2_ftnet_dreamflexrewards_noclip_hist30_seed1
     # --resume \
     # --load_run wave_no \
     # --checkpoint model_1999.pt \
@@ -32,7 +32,7 @@
 #     --num_envs 4096 \
 #     --max_iterations 2000 \
 #     --seed 1 \
-#     --run_name flexrewards_norewclip_seed1
+#     --run_name benchmark_v1_flex_native_clip_hist5_seed1
     # --resume \
     # --load_run new_rewards \
     # --checkpoint model_999.pt \
@@ -65,4 +65,4 @@ python scripts/quadlocofault_rsl_rl/train.py \
     --num_envs 4096 \
     --max_iterations 2000 \
     --seed 1 \
-    --run_name gcnrewards_norewclip_take3_seed1
+    --run_name benchmark_v2_equivgcnmlp_dreamflexrewards_noclip_hist30_seed1

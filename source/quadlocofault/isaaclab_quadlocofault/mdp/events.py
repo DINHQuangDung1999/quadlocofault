@@ -28,7 +28,7 @@ def randomize_actuator_faults(
     failure_coef_severe: float | Sequence[float] | torch.Tensor = 0.3,
     failure_coef_moderate: float | Sequence[float] | torch.Tensor = 0.8,
     num_faults: int = 1,
-    fixed_joint_idx: int | None = None,
+    fixed_joint_idx: int | Sequence[int] | torch.Tensor | None = None,
     apply_once_per_episode: bool = False,
 ):
     asset: Articulation = env.scene[asset_cfg.name]
@@ -88,7 +88,7 @@ def randomize_actuator_faults(
                 dtype=torch.long,
                 device=asset.device,
             )
-        else:
+        elif isinstance(fixed_joint_idx, int):
             if num_faults != 1:
                 raise ValueError("fixed_joint_idx requires num_faults=1.")
             if not 0 <= fixed_joint_idx < size:
@@ -101,6 +101,23 @@ def randomize_actuator_faults(
                 dtype=torch.long,
                 device=asset.device,
             )
+        else:
+            if num_faults != 1:
+                raise ValueError("Per-environment fixed_joint_idx requires num_faults=1.")
+            joint_indices = torch.as_tensor(
+                fixed_joint_idx, dtype=torch.long, device=asset.device
+            ).reshape(-1)
+            if joint_indices.numel() == env.scene.num_envs:
+                joint_indices = joint_indices[env_ids]
+            elif joint_indices.numel() != N:
+                raise ValueError(
+                    "Per-environment fixed_joint_idx must contain either "
+                    f"{env.scene.num_envs} entries or {N} target entries, got "
+                    f"{joint_indices.numel()}."
+                )
+            if torch.any((joint_indices < 0) | (joint_indices >= size)):
+                raise ValueError(f"All fixed joint indices must be in [0, {size - 1}].")
+            faulty_joint_idx = joint_indices.unsqueeze(1)
         # if (asset.faulty_joint_idx[env_ids]).sum() > 0:
         #     breakpoint()
         asset.faulty_joint_idx[env_ids] = torch.zeros((env_ids.shape[0],len(asset.joint_names)), dtype=torch.long, device=asset.device)
