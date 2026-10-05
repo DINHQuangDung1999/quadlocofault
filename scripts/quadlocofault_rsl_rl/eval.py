@@ -37,7 +37,7 @@ from isaaclab.app import AppLauncher
 import cli_args  # isort: skip
 
 
-MODELS = ("GCN", "EquivGCN", "EquivGCNMLP", "FTNet", "FLEX")
+MODELS = ("GCNMLP", "GCN", "EquivGCN", "EquivGCNNoFilm", "EquivGCNUngatedFilm", "EquivGCNFaultOnly", "EquivGCNGCNOnly", "EquivGCNRLLatent", "EquivGCN13Node", "HistoryMLP", "EquivGCNMLP", "EquivGCNMLPConcat", "FTNet", "FLEX")
 FAULT_COEFFICIENTS = (0.0, 0.1)
 JOINT_NAMES = (
     "FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint",
@@ -59,17 +59,36 @@ EVAL_TASKS = {
     model: f"{model}-Isaac-Velocity-Eval-Unitree-Go2-v0" for model in MODELS
 }
 EXPERIMENTS = {
+    "GCNMLP": "unitree_go2_rough_gcn_mlp",
     "GCN": "unitree_go2_rough_gcn",
     "EquivGCN": "unitree_go2_rough_equiv_gcn",
+    "EquivGCNNoFilm": "unitree_go2_rough_equiv_gcn_no_film",
+    "EquivGCNUngatedFilm": "unitree_go2_rough_equiv_gcn_ungated_film",
+    "EquivGCNFaultOnly": "unitree_go2_rough_equiv_gcn_fault_only",
+    "EquivGCNGCNOnly": "unitree_go2_rough_equiv_gcn_gcn_only",
+    "EquivGCNRLLatent": "unitree_go2_rough_equiv_gcn_rl_latent",
+    "EquivGCN13Node": "unitree_go2_rough_equiv_gcn_13_node",
+    "HistoryMLP": "unitree_go2_rough_history_mlp",
     "EquivGCNMLP": "unitree_go2_rough_equiv_gcn_mlp",
+    "EquivGCNMLPConcat": "unitree_go2_rough_equiv_gcn_mlp_concat",
     "FTNet": "unitree_go2_rough_ftnet",
     "FLEX": "unitree_go2_rough_flex",
 }
 
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--protocol", choices=("all", "rough", "flat"), default="all")
+parser.add_argument(
+    "--protocol", choices=("all", "rough", "flat", "latent"), default="all"
+)
 parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
+parser.add_argument(
+    "--fault_coefficients",
+    nargs="+",
+    type=float,
+    choices=FAULT_COEFFICIENTS,
+    default=list(FAULT_COEFFICIENTS),
+    help="Fault coefficients evaluated by the parent process (default: 0.0 0.1).",
+)
 parser.add_argument(
     "--terrains",
     nargs="+",
@@ -88,6 +107,12 @@ parser.add_argument(
     help="Environment seed for a single worker (normally set through --eval_seeds).",
 )
 parser.add_argument("--rough_duration", type=float, default=20.0)
+parser.add_argument(
+    "--rough_command_vx",
+    type=float,
+    default=0.75,
+    help="Forward velocity command for rough evaluation in m/s (matches V8.4 play by default).",
+)
 parser.add_argument(
     "--success_distance",
     type=float,
@@ -111,6 +136,29 @@ parser.add_argument(
 )
 parser.add_argument("--flat_duration", type=float, default=10.0)
 parser.add_argument("--fault_time", type=float, default=3.0)
+parser.add_argument(
+    "--latent_collect_step",
+    type=int,
+    default=50,
+    help="Single latent collection step used when --latent_collect_steps is omitted.",
+)
+parser.add_argument(
+    "--latent_collect_steps",
+    nargs="+",
+    type=int,
+    default=None,
+    help="Policy steps captured in one latent-protocol rollout.",
+)
+parser.add_argument(
+    "--video",
+    action="store_true",
+    help="Record each flat-protocol worker to <output_dir>/videos.",
+)
+parser.add_argument(
+    "--debug_fault_vis",
+    action="store_true",
+    help="Show a marker on the faulted joint during flat evaluation.",
+)
 parser.add_argument(
     "--fault_joint",
     choices=JOINT_NAMES,
@@ -182,7 +230,16 @@ parser.add_argument(
     ),
 )
 parser.add_argument("--equivgcn_checkpoint", type=str, default=None)
+parser.add_argument("--equivgcn_no_film_checkpoint", type=str, default=None)
+parser.add_argument("--equivgcn_ungated_film_checkpoint", type=str, default=None)
+parser.add_argument("--equivgcn_fault_only_checkpoint", type=str, default=None)
+parser.add_argument("--equivgcn_gcn_only_checkpoint", type=str, default=None)
+parser.add_argument("--equivgcn_rl_latent_checkpoint", type=str, default=None)
+parser.add_argument("--equivgcn_13_node_checkpoint", type=str, default=None)
+parser.add_argument("--history_mlp_checkpoint", type=str, default=None)
+parser.add_argument("--gcn_mlp_checkpoint", type=str, default=None)
 parser.add_argument("--equiv_gcn_mlp_checkpoint", type=str, default=None)
+parser.add_argument("--equiv_gcn_mlp_concat_checkpoint", type=str, default=None)
 parser.add_argument("--gcn_checkpoint", type=str, default=None)
 parser.add_argument("--ftnet_checkpoint", type=str, default=None)
 parser.add_argument("--flex_checkpoint", type=str, default=None)
@@ -208,17 +265,37 @@ parser.add_argument(
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.video:
+    args_cli.enable_cameras = True
 
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _latent_collect_steps() -> list[int]:
+    steps = (
+        args_cli.latent_collect_steps
+        if args_cli.latent_collect_steps is not None
+        else [args_cli.latent_collect_step]
+    )
+    return sorted(set(steps))
+
+
 def _checkpoint_override(model: str) -> str | None:
     argument_names = {
+        "GCNMLP": "gcn_mlp_checkpoint",
         "GCN": "gcn_checkpoint",
         "EquivGCN": "equivgcn_checkpoint",
+        "EquivGCNNoFilm": "equivgcn_no_film_checkpoint",
+        "EquivGCNUngatedFilm": "equivgcn_ungated_film_checkpoint",
+        "EquivGCNFaultOnly": "equivgcn_fault_only_checkpoint",
+        "EquivGCNGCNOnly": "equivgcn_gcn_only_checkpoint",
+        "EquivGCNRLLatent": "equivgcn_rl_latent_checkpoint",
+        "EquivGCN13Node": "equivgcn_13_node_checkpoint",
+        "HistoryMLP": "history_mlp_checkpoint",
         "EquivGCNMLP": "equiv_gcn_mlp_checkpoint",
+        "EquivGCNMLPConcat": "equiv_gcn_mlp_concat_checkpoint",
         "FTNet": "ftnet_checkpoint",
         "FLEX": "flex_checkpoint",
     }
@@ -319,6 +396,7 @@ def _matches_saved_run(row: dict, checkpoint: Path, num_envs: int) -> bool:
         "horizon_s": args_cli.rough_duration,
         "initial_xy_range_m": 0.5,
         "initial_yaw_range_rad": math.pi,
+        "command_vx_mps": 1.0 if row.get("terrain") == "flat" else args_cli.rough_command_vx,
     }
     for key, expected in required_values.items():
         saved = row.get(key)
@@ -399,6 +477,8 @@ def _run_parent() -> int:
         raise ValueError("--flex_history_length must be positive.")
     if args_cli.rough_duration <= 0.0 or args_cli.flat_duration <= 0.0:
         raise ValueError("Evaluation durations must be positive.")
+    if args_cli.rough_command_vx <= 0.0:
+        raise ValueError("--rough_command_vx must be positive.")
     if args_cli.success_distance is not None and args_cli.success_distance <= 0.0:
         raise ValueError("--success_distance must be positive when specified.")
     if args_cli.success_distance_margin < 0.0:
@@ -424,8 +504,20 @@ def _run_parent() -> int:
     )
     if args_cli.batch_fault_joints and args_cli.fault_joints is None:
         raise ValueError("--batch_fault_joints requires --fault_joints.")
-    if args_cli.batch_fault_joints and args_cli.protocol != "rough":
-        raise ValueError("--batch_fault_joints currently supports --protocol rough only.")
+    if args_cli.batch_fault_joints and args_cli.protocol not in ("rough", "latent"):
+        raise ValueError(
+            "--batch_fault_joints currently supports --protocol rough or latent only."
+        )
+    if args_cli.video and args_cli.protocol != "flat":
+        raise ValueError("--video currently supports --protocol flat only.")
+    if any(step < 0 for step in _latent_collect_steps()):
+        raise ValueError("Latent collection steps must be non-negative.")
+    if args_cli.protocol == "latent" and any(
+        model not in ("GCNMLP", "EquivGCN", "EquivGCNNoFilm", "EquivGCNUngatedFilm", "EquivGCNFaultOnly", "EquivGCNGCNOnly", "EquivGCNRLLatent", "EquivGCN13Node", "HistoryMLP", "EquivGCNMLP", "EquivGCNMLPConcat") for model in args_cli.models
+    ):
+        raise ValueError(
+            "The latent protocol supports only EquivGCN and EquivGCNMLP actors."
+        )
     joint_batches = (
         [list(selected_joints)]
         if args_cli.batch_fault_joints
@@ -436,10 +528,11 @@ def _run_parent() -> int:
         if args_cli.eval_seeds is not None
         else [args_cli.seed if args_cli.seed is not None else 0]
     )
-    results: dict[str, list[dict]] = {"rough": [], "flat": []}
+    results: dict[str, list[dict]] = {"rough": [], "flat": [], "latent": []}
     saved_rows = {
         "rough": _read_csv(output_dir / "rough_locomotion_lifetime.csv"),
         "flat": _read_csv(output_dir / "flat_ate.csv"),
+        "latent": [],
     }
 
     with tempfile.TemporaryDirectory(prefix="quadlocofault_eval_") as temp_dir:
@@ -462,7 +555,7 @@ def _run_parent() -> int:
                     )
                     for seed in selected_seeds:
                         for terrain in terrain_names:
-                            for fault_coef in FAULT_COEFFICIENTS:
+                            for fault_coef in args_cli.fault_coefficients:
                                 cases = [
                                     {
                                         "model": model,
@@ -473,7 +566,7 @@ def _run_parent() -> int:
                                     }
                                     for fault_joint in fault_batch
                                 ]
-                                already_saved = all(
+                                already_saved = protocol != "latent" and all(
                                     any(
                                         _case_key(row) == _case_key(case)
                                         and _matches_saved_run(row, checkpoint, args_cli.num_envs)
@@ -532,14 +625,19 @@ def _run_parent() -> int:
                                 )
                                 for row in rows:
                                     results[protocol].append(row)
-                                    saved_rows[protocol].append(row)
-                                    _persist_result(output_dir, protocol, row)
+                                    if protocol != "latent":
+                                        saved_rows[protocol].append(row)
+                                        _persist_result(output_dir, protocol, row)
+                                    else:
+                                        print(f"[INFO] Wrote {row['latent_npz']}")
 
     if results["rough"]:
         _write_csv(output_dir / "rough_locomotion_lifetime.csv", results["rough"])
     if results["flat"]:
         _write_csv(output_dir / "flat_ate.csv", results["flat"])
     for protocol, protocol_rows in results.items():
+        if protocol == "latent":
+            continue
         for fault_joint in selected_joints:
             for seed in selected_seeds:
                 subset = [
@@ -582,17 +680,23 @@ def _run_worker() -> int:
         ManagerBasedRLEnvCfg,
         multi_agent_to_single_agent,
     )
+    from isaaclab.markers import VisualizationMarkers
+    from isaaclab.markers.config import RAY_CASTER_MARKER_CFG
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, handle_deprecated_rsl_rl_cfg
     from isaaclab_tasks.utils.hydra import hydra_task_config
     from isaaclab_quadlocofault_rl.rsl_rl import CustomRslRlVecEnvWrapper
 
     import isaaclab_tasks  # noqa: F401
     import isaaclab_quadlocofault_tasks  # noqa: F401
+    import isaacsim.core.utils.stage as stage_utils
+    from pxr import UsdPhysics
 
     installed_version = metadata.version("rsl-rl-lib")
 
     def configure_common(env_cfg) -> None:
         env_cfg.scene.num_envs = args_cli.num_envs
+        env_cfg.events.physics_material.params["static_friction_range"] = (0.8, 0.8)
+        env_cfg.events.physics_material.params["dynamic_friction_range"] = (0.8, 0.8)
         env_cfg.curriculum.terrain_levels = None
         env_cfg.curriculum.actuator_faults = None
         env_cfg.events.add_base_mass = None
@@ -630,11 +734,18 @@ def _run_worker() -> int:
                     "of batched fault joints."
                 )
             envs_per_joint = env_cfg.scene.num_envs // len(args_cli.worker_fault_joints)
-            fixed_joint_idx = [
-                JOINT_NAMES.index(joint_name)
-                for joint_name in args_cli.worker_fault_joints
-                for _ in range(envs_per_joint)
-            ]
+            if args_cli.protocol == "latent":
+                fixed_joint_idx = [
+                    JOINT_NAMES.index(joint_name)
+                    for _ in range(envs_per_joint)
+                    for joint_name in args_cli.worker_fault_joints
+                ]
+            else:
+                fixed_joint_idx = [
+                    JOINT_NAMES.index(joint_name)
+                    for joint_name in args_cli.worker_fault_joints
+                    for _ in range(envs_per_joint)
+                ]
         else:
             fixed_joint_idx = (
                 JOINT_NAMES.index(args_cli.fault_joint)
@@ -653,7 +764,9 @@ def _run_worker() -> int:
     def configure_rough(env_cfg) -> None:
         configure_common(env_cfg)
         env_cfg.episode_length_s = args_cli.rough_duration
-        env_cfg.commands.base_velocity.ranges.lin_vel_x = (0.5, 0.5)
+        env_cfg.commands.base_velocity.ranges.lin_vel_x = (
+            args_cli.rough_command_vx, args_cli.rough_command_vx
+        )
         env_cfg.commands.base_velocity.resampling_time_range = (
             args_cli.rough_duration + 1.0,
             args_cli.rough_duration + 1.0,
@@ -693,13 +806,52 @@ def _run_worker() -> int:
             args_cli.flat_duration + 1.0,
             args_cli.flat_duration + 1.0,
         )
-        env_cfg.scene.terrain.terrain_type = "plane"
-        env_cfg.scene.terrain.terrain_generator = None
+        # Keep the rough-training terrain importer and its physics material,
+        # but select only its MeshPlaneTerrainCfg subterrain.  This differs
+        # from replacing the generator with the standalone infinite plane
+        # used by the separately registered flat-training environments.
+        generator = env_cfg.scene.terrain.terrain_generator
+        if generator is None or "flat" not in generator.sub_terrains:
+            raise ValueError(
+                "Flat recovery requires the 'flat' subterrain from the rough terrain generator."
+            )
+        generator.curriculum = False
+        env_cfg.scene.terrain.max_init_terrain_level = None
+        for subterrain in generator.sub_terrains.values():
+            subterrain.proportion = 0.0
+        generator.sub_terrains["flat"].proportion = 1.0
+
+        fault_event = env_cfg.events.randomize_actuator_faults
+        fault_event.mode = "interval"
+        fault_event.interval_range_s = (args_cli.fault_time, args_cli.fault_time)
+
+    def configure_latent(env_cfg) -> None:
+        """Configure mixed rough terrain with one delayed persistent fault."""
+        configure_common(env_cfg)
+        env_cfg.episode_length_s = max(
+            env_cfg.episode_length_s,
+            (max(_latent_collect_steps()) + 2) * env_cfg.sim.dt * env_cfg.decimation,
+        )
+        env_cfg.commands.base_velocity.ranges.lin_vel_x = (0.5, 0.5)
+        env_cfg.commands.base_velocity.resampling_time_range = (
+            env_cfg.episode_length_s + 1.0,
+            env_cfg.episode_length_s + 1.0,
+        )
+
+        generator = env_cfg.scene.terrain.terrain_generator
+        if generator is None:
+            raise ValueError("The latent protocol requires the rough terrain generator.")
+        generator.curriculum = False
+        generator.difficulty_range = (
+            args_cli.terrain_difficulty_min,
+            args_cli.terrain_difficulty_max,
+        )
         env_cfg.scene.terrain.max_init_terrain_level = None
 
         fault_event = env_cfg.events.randomize_actuator_faults
         fault_event.mode = "interval"
         fault_event.interval_range_s = (args_cli.fault_time, args_cli.fault_time)
+        fault_event.params["apply_once_per_episode"] = True
 
     def create_runner(env, agent_cfg):
         if agent_cfg.class_name == "OnPolicyRunner":
@@ -845,7 +997,7 @@ def _run_worker() -> int:
                 "fault_joint": fault_joint,
                 "seed": int(args_cli.seed),
                 "fault_time_s": 0.0,
-                "command_vx_mps": 0.5,
+                "command_vx_mps": args_cli.rough_command_vx,
                 "num_envs": int(group_mask.sum().item()),
                 "horizon_s": max_steps * dt,
                 "success_distance_m": float(success_distance),
@@ -912,46 +1064,6 @@ def _run_worker() -> int:
             results.append(result_for_group(group_mask, joint_name))
         return results
 
-    def write_contact_plot(
-        times: list[float],
-        contacts: list[list[float]],
-        foot_names: list[str],
-    ) -> Path:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        figure, axis = plt.subplots(figsize=(10, 3.8), constrained_layout=True)
-        contact_array = np.asarray(contacts).T
-        for foot_index, foot_name in enumerate(foot_names):
-            axis.step(
-                times,
-                contact_array[foot_index] + foot_index,
-                where="post",
-                label=foot_name,
-            )
-        axis.axvline(args_cli.fault_time, color="red", linestyle="--", label="fault")
-        axis.set_yticks(range(len(foot_names)), foot_names)
-        axis.set_xlabel("Time (s)")
-        axis.set_ylabel("Foot contact")
-        axis.set_title(
-            f"{args_cli.model}, fault coefficient={args_cli.fault_coef:.1f}, "
-            f"environment={args_cli.plot_env_id}"
-        )
-        axis.set_xlim(0.0, args_cli.flat_duration)
-        axis.grid(alpha=0.25)
-        axis.legend(loc="upper right")
-        output_dir = Path(args_cli.output_dir).expanduser().resolve() / "contact_plots"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / (
-            f"{args_cli.model.lower()}_{args_cli.fault_joint or 'random_joint'}_"
-            f"seed_{args_cli.seed}_fault_{args_cli.fault_coef:.1f}_contacts.png"
-        )
-        figure.savefig(output_path, dpi=180)
-        plt.close(figure)
-        return output_path
-
     def evaluate_flat(env, policy, policy_module) -> dict:
         if not 0 <= args_cli.plot_env_id < env.num_envs:
             raise ValueError(f"--plot_env_id must be in [0, {env.num_envs - 1}].")
@@ -962,6 +1074,24 @@ def _run_worker() -> int:
         fault_step = round(args_cli.fault_time / dt)
         sensor = base_env.scene.sensors["contact_forces"]
         foot_ids, foot_names = sensor.find_bodies(".*_foot", preserve_order=True)
+        marker_body_ids = None
+        if args_cli.debug_fault_vis:
+            if not hasattr(base_env, "_fault_marker"):
+                raise AttributeError(
+                    "--debug_fault_vis requires an environment with a fault marker."
+                )
+            asset = base_env.scene["robot"]
+            stage = stage_utils.get_current_stage()
+            dof_paths = asset.root_physx_view.dof_paths[0]
+            body_name_to_id = {name: index for index, name in enumerate(asset.body_names)}
+            child_body_ids = []
+            for joint_path in dof_paths:
+                joint_prim = UsdPhysics.Joint.Get(stage, joint_path)
+                child_path = joint_prim.GetBody1Rel().GetTargets()[0]
+                child_name = child_path.pathString.split("/")[-1]
+                child_body_ids.append(body_name_to_id[child_name])
+            marker_body_ids = torch.tensor(child_body_ids, device=asset.device)
+            base_env._fault_marker.set_visibility(False)
         alive = torch.ones(env.num_envs, dtype=torch.bool, device=base_env.device)
         total_abs_vx_error = torch.tensor(0.0, device=base_env.device)
         post_abs_vx_error = torch.tensor(0.0, device=base_env.device)
@@ -970,6 +1100,12 @@ def _run_worker() -> int:
         post_samples = 0
         times: list[float] = []
         contact_history: list[list[float]] = []
+        command_xy_history: list[list[float]] = []
+        measured_xy_history: list[list[float]] = []
+        abs_vx_error_history: list[float] = []
+        xy_error_history: list[float] = []
+        fault_probability_history: list[list[float]] = []
+        alive_history: list[bool] = []
         plot_env_alive = True
         obs = env.get_observations()
 
@@ -977,9 +1113,40 @@ def _run_worker() -> int:
             for step in range(max_steps):
                 outputs = policy(obs)
                 actions = outputs[0] if isinstance(outputs, tuple) else outputs
+                fault_logits = None
+                if isinstance(outputs, tuple) and len(outputs) > 1:
+                    auxiliary = outputs[1]
+                    if args_cli.model == "FLEX" and (
+                        isinstance(auxiliary, tuple)
+                        and len(auxiliary) > 7
+                        and torch.is_tensor(auxiliary[7])
+                        and auxiliary[7].shape[-1] == len(JOINT_NAMES)
+                    ):
+                        fault_logits = auxiliary[7]
+                    elif (
+                        isinstance(auxiliary, tuple)
+                        and len(auxiliary) > 1
+                        and torch.is_tensor(auxiliary[1])
+                        and auxiliary[1].shape[-1] == len(JOINT_NAMES)
+                    ):
+                        fault_logits = auxiliary[1]
                 obs, _, dones, _ = env.step(actions)
                 dones = dones.bool()
                 terminated = base_env.reset_terminated.bool()
+
+                if marker_body_ids is not None:
+                    asset = base_env.scene["robot"]
+                    fault_entries = asset.faulty_joint_idx.nonzero(as_tuple=False)
+                    if fault_entries.numel() == 0:
+                        base_env._fault_marker.set_visibility(False)
+                    else:
+                        marker_env_ids = fault_entries[:, 0]
+                        marker_joint_ids = fault_entries[:, 1]
+                        marker_positions = asset.data.body_pos_w[
+                            marker_env_ids, marker_body_ids[marker_joint_ids], :
+                        ]
+                        base_env._fault_marker.set_visibility(True)
+                        base_env._fault_marker.visualize(translations=marker_positions)
 
                 command = base_env.command_manager.get_command("base_velocity")
                 measured_xy = base_env.scene["robot"].data.root_lin_vel_b[:, :2]
@@ -1002,17 +1169,73 @@ def _run_worker() -> int:
                 contacts = foot_forces > args_cli.contact_threshold
                 times.append((step + 1) * dt)
                 if plot_env_alive:
+                    env_id = args_cli.plot_env_id
                     contact_history.append(
-                        contacts[args_cli.plot_env_id].float().cpu().tolist()
+                        contacts[env_id].float().cpu().tolist()
                     )
+                    command_xy_history.append(command[env_id, :2].cpu().tolist())
+                    measured_xy_history.append(measured_xy[env_id].cpu().tolist())
+                    abs_vx_error_history.append(float(abs_vx_error[env_id].item()))
+                    xy_error_history.append(float(abs_xy_error[env_id].item()))
+                    if fault_logits is None:
+                        fault_probability_history.append(
+                            [float("nan")] * len(JOINT_NAMES)
+                        )
+                    else:
+                        fault_probability_history.append(
+                            torch.sigmoid(fault_logits[env_id]).cpu().tolist()
+                        )
                 else:
                     contact_history.append([float("nan")] * len(foot_names))
+                    command_xy_history.append([float("nan"), float("nan")])
+                    measured_xy_history.append([float("nan"), float("nan")])
+                    abs_vx_error_history.append(float("nan"))
+                    xy_error_history.append(float("nan"))
+                    fault_probability_history.append(
+                        [float("nan")] * len(JOINT_NAMES)
+                    )
+                alive_history.append(plot_env_alive)
                 plot_env_alive &= not bool(terminated[args_cli.plot_env_id].item())
 
                 alive &= ~terminated
                 reset_policy(policy, policy_module, dones)
 
-        plot_path = write_contact_plot(times, contact_history, foot_names)
+        timeseries_dir = Path(args_cli.output_dir).expanduser().resolve() / "timeseries"
+        timeseries_dir.mkdir(parents=True, exist_ok=True)
+        timeseries_path = timeseries_dir / (
+            f"{args_cli.model.lower()}_{args_cli.fault_joint or 'random_joint'}_"
+            f"seed_{args_cli.seed}_fault_{args_cli.fault_coef:.1f}.npz"
+        )
+        xy_error_array = np.asarray(xy_error_history, dtype=np.float32)
+        valid_error = np.isfinite(xy_error_array)
+        cumulative_error = np.cumsum(np.where(valid_error, xy_error_array, 0.0))
+        cumulative_count = np.cumsum(valid_error)
+        cumulative_ate_xy = np.divide(
+            cumulative_error,
+            cumulative_count,
+            out=np.full_like(cumulative_error, np.nan, dtype=np.float32),
+            where=cumulative_count > 0,
+        )
+        cumulative_ate_xy[~valid_error] = np.nan
+        np.savez_compressed(
+            timeseries_path,
+            time_s=np.asarray(times, dtype=np.float32),
+            command_xy_mps=np.asarray(command_xy_history, dtype=np.float32),
+            measured_xy_mps=np.asarray(measured_xy_history, dtype=np.float32),
+            abs_vx_error_mps=np.asarray(abs_vx_error_history, dtype=np.float32),
+            xy_tracking_error_mps=xy_error_array,
+            cumulative_ate_xy_mps=cumulative_ate_xy,
+            fault_probability=np.asarray(fault_probability_history, dtype=np.float32),
+            foot_contact=np.asarray(contact_history, dtype=np.float32),
+            foot_names=np.asarray(foot_names),
+            alive=np.asarray(alive_history, dtype=np.bool_),
+            joint_names=np.asarray(JOINT_NAMES),
+            fault_joint=np.asarray(args_cli.fault_joint or "random_joint"),
+            fault_coefficient=np.asarray(args_cli.fault_coef, dtype=np.float32),
+            fault_time_s=np.asarray(args_cli.fault_time, dtype=np.float32),
+            environment_id=np.asarray(args_cli.plot_env_id, dtype=np.int64),
+            checkpoint=np.asarray(str(Path(args_cli.checkpoint).resolve())),
+        )
         return {
             "model": args_cli.model,
             "terrain": "flat",
@@ -1030,8 +1253,114 @@ def _run_worker() -> int:
             "ate_xy_mps": float((total_abs_xy_error / max(total_samples, 1)).item()),
             "survival_to_10s": float(alive.float().mean().item()),
             "num_resets_before_10s": int((~alive).sum().item()),
-            "contact_plot": str(plot_path),
+            "timeseries_npz": str(timeseries_path),
             "checkpoint": str(Path(args_cli.checkpoint).resolve()),
+        }
+
+    def evaluate_latent(env, policy, policy_module, actor) -> dict:
+        """Save raw EquivGCN fused-latent snapshots without plotting."""
+        required_attributes = (
+            "obs_hist_normalizer",
+            "gcn_encoder",
+            "fault_residual_encoder",
+        )
+        missing = [name for name in required_attributes if not hasattr(actor, name)]
+        if missing:
+            raise TypeError(
+                "The latent protocol requires an EquivGCNActor; "
+                f"the loaded actor is missing {missing}."
+            )
+
+        base_env = env.unwrapped
+        obs = env.get_observations()
+        collect_steps = _latent_collect_steps()
+        collect_step_set = set(collect_steps)
+        snapshots: list[dict[str, torch.Tensor]] = []
+        with torch.inference_mode():
+            for step in range(collect_steps[-1] + 1):
+                if step in collect_step_set:
+                    history = obs["history"]
+                    normalized_history = actor.obs_hist_normalizer(history)
+                    gcn_latent = actor.gcn_encoder(normalized_history).mean(dim=1)
+                    fault_logits, gamma, beta = actor.fault_residual_encoder(
+                        normalized_history
+                    )
+                    fault_probability = torch.sigmoid(fault_logits)
+                    fault_gate = fault_probability.amax(dim=1, keepdim=True)
+                    fused_latent = (
+                        (1.0 + fault_gate * gamma) * gcn_latent
+                        + fault_gate * beta
+                    )
+                    snapshots.append(
+                        {
+                            "fused_latent": fused_latent.detach().float().cpu(),
+                            "gcn_latent": gcn_latent.detach().float().cpu(),
+                            "fault_logits": fault_logits.detach().float().cpu(),
+                            "fault_probability": fault_probability.detach().float().cpu(),
+                            "fault_mask": base_env.scene[
+                                "robot"
+                            ].faulty_joint_idx.detach().bool().cpu(),
+                        }
+                    )
+
+                if step == collect_steps[-1]:
+                    break
+
+                outputs = policy(obs)
+                actions = outputs[0] if isinstance(outputs, tuple) else outputs
+                obs, _, dones, _ = env.step(actions)
+                reset_policy(policy, policy_module, dones.bool())
+
+        asset = base_env.scene["robot"]
+        healthy_class = len(asset.joint_names)
+        fault_masks = torch.stack(
+            [snapshot["fault_mask"] for snapshot in snapshots], dim=0
+        )
+        fault_labels = torch.full(
+            fault_masks.shape[:2], healthy_class, dtype=torch.long
+        )
+        has_fault = fault_masks.any(dim=2)
+        fault_labels[has_fault] = fault_masks[has_fault].float().argmax(dim=1)
+
+        latent_dir = Path(args_cli.output_dir).expanduser().resolve() / "latents"
+        latent_dir.mkdir(parents=True, exist_ok=True)
+        # Keep the filename below common filesystem component-length limits even
+        # when many snapshots are requested.  The exact steps remain in the NPZ.
+        step_label = (
+            f"{collect_steps[0]}-{collect_steps[-1]}_n{len(collect_steps)}"
+        )
+        latent_path = latent_dir / (
+            f"{args_cli.model.lower()}_steps_{step_label}_"
+            f"seed_{args_cli.seed}_fault_{args_cli.fault_coef:.1f}.npz"
+        )
+        np.savez_compressed(
+            latent_path,
+            fused_latent=torch.stack(
+                [snapshot["fused_latent"] for snapshot in snapshots], dim=0
+            ).numpy(),
+            gcn_latent=torch.stack(
+                [snapshot["gcn_latent"] for snapshot in snapshots], dim=0
+            ).numpy(),
+            fault_logits=torch.stack(
+                [snapshot["fault_logits"] for snapshot in snapshots], dim=0
+            ).numpy(),
+            fault_probability=torch.stack(
+                [snapshot["fault_probability"] for snapshot in snapshots], dim=0
+            ).numpy(),
+            fault_labels=fault_labels.numpy(),
+            fault_mask=fault_masks.numpy(),
+            joint_names=np.asarray(asset.joint_names),
+            healthy_class=np.asarray(healthy_class, dtype=np.int64),
+            collect_steps=np.asarray(collect_steps, dtype=np.int64),
+            seed=np.asarray(args_cli.seed, dtype=np.int64),
+            fault_coefficient=np.asarray(args_cli.fault_coef, dtype=np.float32),
+            checkpoint=np.asarray(str(Path(args_cli.checkpoint).resolve())),
+        )
+        return {
+            "latent_npz": str(latent_path),
+            "num_envs": base_env.num_envs,
+            "num_collection_steps": len(collect_steps),
+            "latent_dim": int(snapshots[0]["fused_latent"].shape[1]),
         }
 
     @hydra_task_config(args_cli.task, args_cli.agent)
@@ -1055,19 +1384,54 @@ def _run_worker() -> int:
             configure_rough(env_cfg)
         elif args_cli.protocol == "flat":
             configure_flat(env_cfg)
+        elif args_cli.protocol == "latent":
+            configure_latent(env_cfg)
         else:
-            raise ValueError("Worker protocol must be rough or flat.")
+            raise ValueError("Worker protocol must be rough, flat, or latent.")
 
-        env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
+        env = gym.make(
+            args_cli.task,
+            cfg=env_cfg,
+            render_mode="rgb_array" if args_cli.video else None,
+        )
+        if args_cli.debug_fault_vis:
+            marker_cfg = RAY_CASTER_MARKER_CFG.replace(
+                prim_path="/Visuals/faulty_joint"
+            )
+            marker_cfg.markers["hit"].radius = 0.05
+            env.unwrapped._fault_marker = VisualizationMarkers(marker_cfg)
+            env.unwrapped._fault_marker.set_visibility(False)
         if isinstance(env.unwrapped, DirectMARLEnv):
             env = multi_agent_to_single_agent(env)
+        if args_cli.video:
+            video_folder = Path(args_cli.output_dir).expanduser().resolve() / "videos"
+            video_folder.mkdir(parents=True, exist_ok=True)
+            video_length = round(args_cli.flat_duration / env.unwrapped.step_dt)
+            joint_label = args_cli.fault_joint or "random_joint"
+            video_name = (
+                f"{args_cli.model.lower()}_{joint_label}_"
+                f"alpha_{args_cli.fault_coef:.1f}_seed_{args_cli.seed}"
+            )
+            env = gym.wrappers.RecordVideo(
+                env,
+                video_folder=str(video_folder),
+                step_trigger=lambda step: step == 0,
+                video_length=video_length,
+                name_prefix=video_name,
+                disable_logger=True,
+            )
+            print(f"[INFO] Recording {video_length} steps to {video_folder}.")
         env = CustomRslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
         runner, policy, policy_module = create_runner(env, agent_cfg)
         try:
             if args_cli.protocol == "rough":
                 result = evaluate_rough(env, policy, policy_module)
-            else:
+            elif args_cli.protocol == "flat":
                 result = evaluate_flat(env, policy, policy_module)
+            else:
+                result = evaluate_latent(
+                    env, policy, policy_module, runner.alg.actor
+                )
             result_path = Path(args_cli.result_json).expanduser().resolve()
             result_path.parent.mkdir(parents=True, exist_ok=True)
             result_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

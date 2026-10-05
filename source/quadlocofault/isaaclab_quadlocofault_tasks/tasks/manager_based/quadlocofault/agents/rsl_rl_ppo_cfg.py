@@ -211,6 +211,81 @@ class UnitreeGo2RoughPPOEquivGCNRunnerCfg(UnitreeGo2RoughPPOGCNRunnerCfg):
 
 
 @configclass
+class UnitreeGo2RoughPPOEquivGCNNoFilmRunnerCfg(UnitreeGo2RoughPPOEquivGCNRunnerCfg):
+    """EquivGCN TCN ablation without latent FiLM modulation."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actor.use_film = False
+        self.experiment_name = "unitree_go2_rough_equiv_gcn_no_film"
+
+
+@configclass
+class UnitreeGo2RoughPPOEquivGCNUngatedFilmRunnerCfg(UnitreeGo2RoughPPOEquivGCNRunnerCfg):
+    """Apply FiLM without multiplying by predicted fault probability."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actor.use_fault_gate = False
+        self.experiment_name = "unitree_go2_rough_equiv_gcn_ungated_film"
+
+
+@configclass
+class UnitreeGo2RoughPPOEquivGCNFaultOnlyRunnerCfg(UnitreeGo2RoughPPOEquivGCNRunnerCfg):
+    """Give the actor predicted fault probabilities without the GCN latent."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actor.use_film = False
+        self.actor.actor_latent_input = "fault"
+        self.experiment_name = "unitree_go2_rough_equiv_gcn_fault_only"
+
+
+@configclass
+class UnitreeGo2RoughPPOEquivGCNGCNOnlyRunnerCfg(UnitreeGo2RoughPPOEquivGCNRunnerCfg):
+    """Give the actor the GCN latent without predicted fault probabilities."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actor.use_film = False
+        self.actor.actor_latent_input = "gcn"
+        self.experiment_name = "unitree_go2_rough_equiv_gcn_gcn_only"
+
+
+@configclass
+class UnitreeGo2RoughPPOEquivGCNRLLatentRunnerCfg(UnitreeGo2RoughPPOEquivGCNRunnerCfg):
+    """Learn a 12-D temporal actor latent from PPO without fault labels."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actor.use_film = False
+        self.actor.supervise_fault = False
+        self.experiment_name = "unitree_go2_rough_equiv_gcn_rl_latent"
+
+
+@configclass
+class UnitreeGo2RoughPPOEquivGCN13NodeRunnerCfg(UnitreeGo2RoughPPOEquivGCNRunnerCfg):
+    """EquivGCN TCN with the standard 13-node, raw-coordinate graph."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actor.graph_encoder_type = "standard_13"
+        self.actor.graph_reflection_equivariant = False
+        self.experiment_name = "unitree_go2_rough_equiv_gcn_13_node"
+
+
+@configclass
+class UnitreeGo2RoughPPOHistoryMLPRunnerCfg(UnitreeGo2RoughPPOEquivGCNRunnerCfg):
+    """Plain history MLP for healthy dynamics; unchanged TCN fault encoder."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actor.healthy_encoder_type = "mlp"
+        self.actor.graph_encoder_type = "none"
+        self.experiment_name = "unitree_go2_rough_history_mlp"
+
+
+@configclass
 class UnitreeGo2RoughPPOEquivGCNMLPRunnerCfg(UnitreeGo2RoughPPOEquivGCNRunnerCfg):
     """EquivGCN ablation using an MLP instead of the fault-residual TCN."""
 
@@ -219,6 +294,27 @@ class UnitreeGo2RoughPPOEquivGCNMLPRunnerCfg(UnitreeGo2RoughPPOEquivGCNRunnerCfg
         self.actor.fault_encoder_type = "mlp"
         self.actor.fault_mlp_hidden_dims = (512, 256, 128)
         self.experiment_name = "unitree_go2_rough_equiv_gcn_mlp"
+
+
+@configclass
+class UnitreeGo2RoughPPOEquivGCNMLPConcatRunnerCfg(UnitreeGo2RoughPPOEquivGCNMLPRunnerCfg):
+    """Fault-probability concatenation ablation without FiLM modulation."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actor.use_film = False
+        self.experiment_name = "unitree_go2_rough_equiv_gcn_mlp_concat"
+
+
+@configclass
+class UnitreeGo2RoughPPOGCNMLPRunnerCfg(UnitreeGo2RoughPPOEquivGCNMLPRunnerCfg):
+    """Matched graph-reflection ablation retaining the fault MLP and FiLM."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.actor.graph_reflection_equivariant = False
+        self.actor.use_film = True
+        self.experiment_name = "unitree_go2_rough_gcn_mlp"
 
 
 @configclass

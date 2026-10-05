@@ -11,25 +11,41 @@
 # python scripts/quadlocofault_rsl_rl/play.py \
 #     --task FTNet-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
 #     --num_envs 1 \
-#     --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_ftnet/2026-08-26_06-56-36_benchmark_v1_ftnet_native_clip_hist30_seed1/model_1999.pt \
-#     --fault_joint FR_calf_joint
+#     --checkpoint /home/qdinh/summerschool_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_ftnet/2026-08-30_15-20-27_benchmark_v6_4000epochs_ftnet_dreamflexrewards_nopowerdistr_leglinkcontact_footplanarvel_noclip_hist30_seed1/model_3999.pt \
+#     --fault_joint FR_hip_joint
 
 # python scripts/quadlocofault_rsl_rl/play.py \
 #     --task GCN-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
 #     --num_envs 32 \
 #     --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_gcn/baseline/model_3999.pt
 
-# python scripts/quadlocofault_rsl_rl/play.py \
-#     --task EquivGCN-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
-#     --num_envs 32 \
-#     --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_equiv_gcn/baseline/model_3999.pt \
-#     --fault_tcn_checkpoint /home/dung-admin/quadloco_ws/quadlocofault/datasets/prop_fault/FTNet-Isaac-Velocity-Rough-Unitree-Go2-Play-v0/2026-07-27_11-45-57/fault_tcn_runs/2026-07-27_11-53-18/best.pt
-
 python scripts/quadlocofault_rsl_rl/play.py \
-    --task EquivGCNMLP-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
+    --task EquivGCN-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
     --num_envs 1 \
-    --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_equiv_gcn_mlp/2026-08-27_01-13-57_benchmark_v2_equivgcnmlp_dreamflexrewards_noclip_hist30_seed1/model_1999.pt \
-    --fault_joint RR_hip_joint \
+    --checkpoint /home/qdinh/summerschool_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_equiv_gcn/2026-10-01_07-31-48_benchmark_v8.4_complete_fault_mixed_terrain_4000epochs_equivgcn_hist30_seed1/model_3999.pt \
+    --fault_joint FR_hip_joint \
+    --terrain_type flat
+
+# python scripts/quadlocofault_rsl_rl/play.py \
+#     --task EquivGCN13Node-V84-CompleteFault-MixedTerrain-Unitree-Go2-Play-v0 \
+#     --num_envs 1 \
+#     --checkpoint /home/qdinh/summerschool_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_equiv_gcn_13_node/2026-10-03_03-20-06_benchmark_v8.4_complete_fault_mixed_terrain_4000epochs_equivgcn_13_node_hist30_seed1/model_3999.pt \
+#     --fault_joint RR_hip_joint \
+#     --terrain_type random_rough
+
+# python scripts/quadlocofault_rsl_rl/play.py \
+#     --task EquivGCNMLP-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
+#     --num_envs 1 \
+#     --checkpoint /home/qdinh/summerschool_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_equiv_gcn_mlp/2026-09-29_23-24-45_benchmark_v8.4_complete_fault_mixed_terrain_4000epochs_equivgcnmlp_film_hist30_seed1/model_3999.pt\
+#     --fault_joint FL_calf_joint \
+#     --terrain_type random_rough
+    # --headless \
+    # --export both \
+    # --export_only
+    # --video \
+    # --video_length 500 \
+    # --real-time \
+    # --headless
 #     --terrain_type random_rough
     # --headless \
     # --export both \
@@ -39,8 +55,8 @@ python scripts/quadlocofault_rsl_rl/play.py \
 # python scripts/quadlocofault_rsl_rl/play.py\
 #     --task FLEX-Isaac-Velocity-Rough-Unitree-Go2-Play-v0 \
 #     --num_envs 1 \
-#     --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_flex/2026-08-26_10-36-33_benchmark_v1_flex_native_clip_hist5_seed1/model_1999.pt \
-#     --fault_joint FR_calf_joint
+#     --checkpoint /home/qdinh/summerschool_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_flex/2026-08-31_00-01-04_benchmark_v6_4000epochs_flex_dreamflexrewards_nopowerdistr_leglinkcontact_footplanarvel_noclip_hist30_seed1/model_3999.pt \
+#     --fault_joint FR_hip_joint
     # --checkpoint /home/dung-admin/quadloco_ws/quadlocofault/logs/rsl_rl/unitree_go2_rough_flex/2026-06-10_23-36-44/model_1999.pt
 
 # python scripts/quadlocofault_rsl_rl/play.py \

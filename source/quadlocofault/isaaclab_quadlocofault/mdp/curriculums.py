@@ -153,12 +153,20 @@ def actuator_fault_episode_reward_event(
     num_levels: int = 20,
     successes_per_level: int = 1,
     event_name: str = "randomize_actuator_faults",
+    postfault_only: bool = False,
+    min_postfault_duration_s: float = 5.0,
+    faulted_only: bool = False,
 ) -> dict[str, float] | None:
-    """Gradually update the actuator fault event parameters when reward targets are met.
+    """Gradually update fault severity when reward targets are met.
 
-    The schedule advances by one stage after the mean episodic reward over the resetting environments
-    reaches ``reward_threshold`` enough consecutive times. This avoids racing through stages when
-    resets are frequent and the policy is already above threshold.
+    With postfault_only, threshold is a fraction of maximum weighted tracking
+    reward per second. Requires onset snapshots from the persistent fault event,
+    minimum postfault exposure, and no failure termination. Otherwise the legacy
+    whole-episode reward threshold is retained.
+
+    Each environment advances after its own score passes the threshold for
+    successes_per_level consecutive episodes; an unsuccessful episode clears
+    that environment's streak.
     """
     event_cfg = getattr(env.cfg.events, event_name, None)
     if event_cfg is None:
@@ -168,13 +176,58 @@ def actuator_fault_episode_reward_event(
         reward_term_names = tuple(env.reward_manager._episode_sums.keys())
 
     env_ids_tensor = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+    if faulted_only:
+        asset = env.scene["robot"]
+        if not hasattr(asset, "faulty_joint_idx"):
+            # The initial curriculum call precedes reset_actuator_gains, which
+            # creates the fault indicators. No episode has had a fault yet.
+            return None
+        # Healthy episodes are neutral: they neither advance the fault level
+        # nor clear a streak earned in earlier faulted episodes.
+        faulted = asset.faulty_joint_idx[env_ids_tensor].bool().any(dim=1)
+        env_ids_tensor = env_ids_tensor[faulted]
+        if env_ids_tensor.numel() == 0:
+            return None
     episode_reward = torch.zeros(env.num_envs, device=env.device)
     for term_name in reward_term_names:
         if term_name not in env.reward_manager._episode_sums:
             raise ValueError(f"Reward term '{term_name}' not found in reward manager episode sums.")
         episode_reward += env.reward_manager._episode_sums[term_name]
 
-    success = episode_reward[env_ids_tensor] >= move_up_reward_threshold
+    postfault_duration = torch.zeros_like(episode_reward)
+    score = episode_reward
+    if postfault_only:
+        # The selected tracking kernels each have maximum 1 before weighting.
+        maximum_rate = sum(env.reward_manager.get_term_cfg(name).weight for name in reward_term_names)
+        if maximum_rate <= 0 or any(env.reward_manager.get_term_cfg(name).weight < 0 for name in reward_term_names):
+            raise ValueError("Postfault scoring requires positive total tracking-reward weight and no negative weights.")
+        if not 0 <= move_up_reward_threshold <= 1 or min_postfault_duration_s <= 0:
+            raise ValueError("Postfault threshold must be in [0,1] and minimum duration positive.")
+        score = torch.zeros_like(episode_reward)
+        if hasattr(env, "_postfault_start_step"):
+            started = env._postfault_start_step >= 0
+            postfault_duration = torch.where(
+                started,
+                (env.common_step_counter - env._postfault_start_step).float() * env.step_dt,
+                torch.zeros_like(episode_reward),
+            )
+            postfault_reward = episode_reward.clone()
+            for name in reward_term_names:
+                postfault_reward -= env._postfault_reward_start[name]
+            score = torch.where(
+                started,
+                postfault_reward / (maximum_rate * postfault_duration.clamp_min(env.step_dt)),
+                torch.zeros_like(episode_reward),
+            )
+        # A time-limit truncation is acceptable; a physical failure is not,
+        # including simultaneous physical failure and timeout.
+        success = (
+            (score[env_ids_tensor] + 1e-6 >= move_up_reward_threshold)
+            & (postfault_duration[env_ids_tensor] + 1e-6 >= min_postfault_duration_s)
+            & ~env.termination_manager.terminated[env_ids_tensor]
+        )
+    else:
+        success = episode_reward[env_ids_tensor] >= move_up_reward_threshold
 
     if not hasattr(env, "_actuator_fault_curriculum_level"):
         env._actuator_fault_curriculum_level = torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
@@ -210,6 +263,9 @@ def actuator_fault_episode_reward_event(
     env._actuator_fault_curriculum_success_count[env_ids_tensor[move_up]] = 0
 
     return {
+        "mean_postfault_score": score[env_ids_tensor].mean() if postfault_only else torch.tensor(0., device=env.device),
+        "mean_postfault_duration_s": postfault_duration[env_ids_tensor].mean(),
+        "success_rate": success.float().mean(),
         "mean_achieved_reward": float(torch.mean(episode_reward[env_ids_tensor]).item()),
         "mean_fault_level": progress[env_ids_tensor].float().mean(),
         "move_up_rate": float(move_up.float().mean().item()),

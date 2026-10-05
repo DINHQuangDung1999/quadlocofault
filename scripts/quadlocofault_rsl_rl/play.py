@@ -28,6 +28,10 @@ FAULT_JOINT_NAMES = (
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
+parser.add_argument("--video_folder", type=str, default=None, help="Directory for the recorded video.")
+parser.add_argument("--fault_coef", type=float, default=None, help="Fixed motor strength for the selected fault joint.")
+parser.add_argument("--fault_time", type=float, default=0.0, help="Time in seconds before applying a fixed fault.")
+parser.add_argument("--viewer_side", choices=("left", "right"), default=None, help="Robot side shown by the viewer.")
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
@@ -646,6 +650,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    # Fix robot-ground friction during playback, including when using a training task ID.
+    env_cfg.events.physics_material.params["static_friction_range"] = (0.8, 0.8)
+    env_cfg.events.physics_material.params["dynamic_friction_range"] = (0.8, 0.8)
+    if args_cli.viewer_side is not None:
+        env_cfg.viewer.eye = (-2.0, -2.0 if args_cli.viewer_side == "left" else 2.0, 1.0)
     if args_cli.terrain_type is not None:
         terrain_generator = env_cfg.scene.terrain.terrain_generator
         if terrain_generator is None:
@@ -665,6 +674,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         fault_event = env_cfg.events.randomize_actuator_faults
         fault_event.params["fixed_joint_idx"] = FAULT_JOINT_NAMES.index(args_cli.fault_joint)
         print(f"[INFO] Fixed actuator fault joint: {args_cli.fault_joint}")
+    if args_cli.fault_coef is not None:
+        if not 0.0 <= args_cli.fault_coef <= 1.0:
+            raise ValueError("--fault_coef must be between 0 and 1.")
+        fault_event = env_cfg.events.randomize_actuator_faults
+        fault_event.params.update(severe_fault_prob=1.0, failure_coef_severe=args_cli.fault_coef,
+                                  failure_coef_moderate=args_cli.fault_coef, apply_once_per_episode=True)
+        # A requested fixed fault must not be skipped by V8.4/V8.5's healthy-episode mix.
+        env_cfg.events.reset_actuator_gains.params["healthy_episode_prob"] = 0.0
+        if args_cli.fault_time < 0.0:
+            raise ValueError("--fault_time must be non-negative.")
+        fault_event.interval_range_s = (args_cli.fault_time, args_cli.fault_time)
+        env_cfg.curriculum.actuator_faults = None
+        print(f"[INFO] Fixed actuator fault strength: {args_cli.fault_coef}")
 
     # handle deprecated configurations
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
@@ -705,9 +727,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
-    # Fault visualization is a play-only concern, so keep it out of the core
-    # environment and create the marker only when a viewport is available.
-    if not args_cli.headless:
+    # Video rendering also has a viewport, even when the app runs headless.
+    if not args_cli.headless or args_cli.video:
         marker_cfg = RAY_CASTER_MARKER_CFG.replace(prim_path="/Visuals/faulty_joint")
         marker_cfg.markers["hit"].radius = 0.05
         env.unwrapped._fault_marker = VisualizationMarkers(marker_cfg)
@@ -719,7 +740,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap for video recording
     if args_cli.video:
         video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "play"),
+            "video_folder": args_cli.video_folder or os.path.join(log_dir, "videos", "play"),
             "step_trigger": lambda step: step == 0,
             "video_length": args_cli.video_length,
             "disable_logger": True,

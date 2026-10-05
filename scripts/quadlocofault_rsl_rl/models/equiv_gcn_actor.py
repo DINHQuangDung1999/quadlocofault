@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 
 from modules import GCNLayer, TemporalConvBlock
+from models.gcn_actor import GCNTemporalEncoder
 from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
 from rsl_rl.modules.distribution import Distribution
 from rsl_rl.utils import resolve_callable
@@ -41,6 +42,7 @@ class EquivGCNTemporalEncoder(nn.Module):
         node_base_dim: int,
         gcn_hidden_dim: int,
         gcn_out_dim: int,
+        canonicalize_reflection: bool = True,
     ) -> None:
         super().__init__()
         if node_dim != 3:
@@ -48,6 +50,7 @@ class EquivGCNTemporalEncoder(nn.Module):
         if node_base_dim != 9:
             raise ValueError(f"EquivGCNTemporalEncoder expects nine base features, got {node_base_dim}.")
 
+        self.canonicalize_reflection = canonicalize_reflection
         self.node_dim = node_dim
         self.node_base_dim = node_base_dim
         self.num_joints = 12
@@ -107,7 +110,8 @@ class EquivGCNTemporalEncoder(nn.Module):
         return joints, bases
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3 or x.shape[-1] != 45:
+        # Python shape validation is only meaningful outside tracing.
+        if not torch.jit.is_tracing() and (x.ndim != 3 or x.shape[-1] != 45):
             raise ValueError("Expected history shape (batch, history, 45).")
 
         position = x[:, :, :12]
@@ -127,8 +131,12 @@ class EquivGCNTemporalEncoder(nn.Module):
         # Canonicalize right hips (FR and RR, at graph-joint indices 6 and 9);
         # thigh/calf coordinates already share the left-side convention for
         # the Go2 joint definitions.
-        joints = joints * self.joint_reflection_sign.view(1, 1, -1, 1)
-        bases = torch.stack((base, base * self.base_reflection_sign), dim=2)
+        if self.canonicalize_reflection:
+            joints = joints * self.joint_reflection_sign.view(1, 1, -1, 1)
+            bases = torch.stack((base, base * self.base_reflection_sign), dim=2)
+        else:
+            # Matched ablation: same topology and weights, raw physical coordinates.
+            bases = torch.stack((base, base), dim=2)
         joints, bases = self._encode_temporal(joints, bases)
 
         graph = torch.stack(
@@ -144,6 +152,28 @@ class EquivGCNTemporalEncoder(nn.Module):
         )
         hidden = F.elu(self.gcn1(graph, self.adj_norm))
         return F.elu(self.gcn2(hidden, self.adj_norm))
+
+
+class HistoryMLPEncoder(nn.Module):
+    """Encode raw 45-D observation history without graph or symmetry operations."""
+
+    def __init__(self, history_length: int, output_dim: int) -> None:
+        super().__init__()
+        self.history_length = history_length
+        self.mlp = nn.Sequential(
+            nn.Linear(history_length * 45, 512), nn.ELU(),
+            nn.Linear(512, 256), nn.ELU(),
+            nn.Linear(256, 128), nn.ELU(),
+            nn.Linear(128, output_dim), nn.ELU(),
+        )
+
+    def forward(self, history: torch.Tensor) -> torch.Tensor:
+        if not torch.jit.is_tracing() and (
+            history.ndim != 3 or history.shape[1:] != (self.history_length, 45)
+        ):
+            raise ValueError(f"Expected history shape (batch, {self.history_length}, 45).")
+        # A singleton feature axis keeps the actor's graph-mean interface intact.
+        return self.mlp(history.flatten(start_dim=1)).unsqueeze(1)
 
 
 class FaultResidualTCN(nn.Module):
@@ -166,6 +196,8 @@ class FaultResidualTCN(nn.Module):
                 f"num_fault_classes must be 12 or 13, got {num_fault_classes}."
             )
         self.film_scale = film_scale
+        self.use_film = True
+        self.film_dim = film_dim
         self.num_fault_classes = num_fault_classes
         self.register_buffer("left_joint_ids", torch.tensor(self._LEFT_JOINT_IDS, dtype=torch.long))
         self.register_buffer("right_joint_ids", torch.tensor(self._RIGHT_JOINT_IDS, dtype=torch.long))
@@ -227,12 +259,15 @@ class FaultResidualTCN(nn.Module):
         )
 
     def forward(self, history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if history.ndim != 3 or history.shape[-1] != 45:
+        if not torch.jit.is_tracing() and (history.ndim != 3 or history.shape[-1] != 45):
             raise ValueError("Expected history shape (batch, history, 45).")
 
         tcn_input = self._symmetry_features(history).permute(0, 2, 1)
         fault_features = self.tcn(tcn_input)[:, :, -1]
         fault_logits = self.fault_head(fault_features)
+        if not self.use_film:
+            zeros = fault_logits.new_zeros((fault_logits.shape[0], self.film_dim))
+            return fault_logits, zeros, zeros
         raw_gamma, raw_beta = self.film_head(fault_features.detach()).chunk(2, dim=-1)
         gamma = self.film_scale * torch.tanh(raw_gamma)
         beta = self.film_scale * torch.tanh(raw_beta)
@@ -273,6 +308,8 @@ class FaultResidualMLP(nn.Module):
 
         self.history_length = history_length
         self.film_scale = film_scale
+        self.use_film = True
+        self.film_dim = film_dim
         self.num_fault_classes = num_fault_classes
         self.register_buffer("left_joint_ids", torch.tensor(self._LEFT_JOINT_IDS, dtype=torch.long))
         self.register_buffer("right_joint_ids", torch.tensor(self._RIGHT_JOINT_IDS, dtype=torch.long))
@@ -336,7 +373,7 @@ class FaultResidualMLP(nn.Module):
         )
 
     def forward(self, history: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if (
+        if not torch.jit.is_tracing() and (
             history.ndim != 3
             or history.shape[1] != self.history_length
             or history.shape[2] != 45
@@ -348,6 +385,9 @@ class FaultResidualMLP(nn.Module):
         mlp_input = self._symmetry_features(history).flatten(start_dim=1)
         fault_features = self.mlp(mlp_input)
         fault_logits = self.fault_head(fault_features)
+        if not self.use_film:
+            zeros = fault_logits.new_zeros((fault_logits.shape[0], self.film_dim))
+            return fault_logits, zeros, zeros
         raw_gamma, raw_beta = self.film_head(fault_features.detach()).chunk(2, dim=-1)
         gamma = self.film_scale * torch.tanh(raw_gamma)
         beta = self.film_scale * torch.tanh(raw_beta)
@@ -371,6 +411,13 @@ class EquivGCNActor(nn.Module):
         gcn_out_dim: int = 16,
         tcn_hidden_dim: int = 16,
         fault_encoder_type: str = "tcn",
+        use_film: bool = True,
+        use_fault_gate: bool = True,
+        actor_latent_input: str = "both",
+        supervise_fault: bool = True,
+        graph_reflection_equivariant: bool = True,
+        graph_encoder_type: str = "equivariant_14",
+        healthy_encoder_type: str = "graph",
         fault_mlp_hidden_dims: tuple[int, ...] | list[int] = (128, 64),
         setup: int = 1,
         **_: object,
@@ -384,6 +431,14 @@ class EquivGCNActor(nn.Module):
         self.gcn_hidden_dim = gcn_hidden_dim
         self.gcn_out_dim = gcn_out_dim
         self.setup = setup
+        self.use_film = use_film
+        if actor_latent_input not in ("both", "fault", "gcn"):
+            raise ValueError(f"Unknown actor_latent_input: {actor_latent_input!r}.")
+        if not supervise_fault and actor_latent_input == "gcn":
+            raise ValueError("Unsupervised fault latent must be an actor input.")
+        self.use_fault_gate = use_fault_gate
+        self.actor_latent_input = actor_latent_input
+        self.supervise_fault = supervise_fault
 
         if obs_normalization:
             self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
@@ -401,12 +456,41 @@ class EquivGCNActor(nn.Module):
             self.distribution = None
             mlp_output_dim = output_dim
 
-        self.gcn_encoder = EquivGCNTemporalEncoder(
-            node_dim=3,
-            node_base_dim=9,
-            gcn_hidden_dim=gcn_hidden_dim,
-            gcn_out_dim=gcn_out_dim,
-        )
+        if healthy_encoder_type == "mlp":
+            self.gcn_encoder = HistoryMLPEncoder(
+                history_length=self.obs_hist_length,
+                output_dim=gcn_out_dim,
+            )
+        elif healthy_encoder_type != "graph":
+            raise ValueError(f"Unknown healthy_encoder_type: {healthy_encoder_type!r}.")
+        elif graph_encoder_type == "equivariant_14":
+            self.gcn_encoder = EquivGCNTemporalEncoder(
+                node_dim=3,
+                node_base_dim=9,
+                gcn_hidden_dim=gcn_hidden_dim,
+                gcn_out_dim=gcn_out_dim,
+                canonicalize_reflection=graph_reflection_equivariant,
+            )
+        elif graph_encoder_type == "standard_13":
+            # Match the standard GCN's single-base topology and raw joint
+            # coordinates, while retaining this actor's TCN, FiLM, and PPO loss.
+            self.gcn_encoder = GCNTemporalEncoder(
+                num_nodes=13,
+                node_dim=3,
+                node_base_dim=9,
+                projection_dim=8,
+                gcn_hidden_dim=gcn_hidden_dim,
+                tcn_hidden_dim=tcn_hidden_dim,
+                tcn_out_dim=32,
+                gcn_out_dim=gcn_out_dim,
+                edges=[
+                    (0, 1), (1, 2), (3, 4), (4, 5),
+                    (6, 7), (7, 8), (9, 10), (10, 11),
+                    (12, 0), (12, 3), (12, 6), (12, 9),
+                ],
+            )
+        else:
+            raise ValueError(f"Unknown graph_encoder_type: {graph_encoder_type!r}.")
         if fault_encoder_type == "tcn":
             self.fault_residual_encoder = FaultResidualTCN(
                 hidden_dim=tcn_hidden_dim,
@@ -436,7 +520,15 @@ class EquivGCNActor(nn.Module):
         # self.fault_residual_encoder.fault_head.requires_grad_(True)
         # self.fault_residual_encoder.film_head.requires_grad_(True)
         
-        actor_input_dim = self.obs_dim + self.action_dim + gcn_out_dim
+        if not self.use_film:
+            self.fault_residual_encoder.use_film = False
+            self.fault_residual_encoder.film_head = nn.Identity()
+
+        actor_input_dim = self.obs_dim
+        if actor_latent_input in ("both", "fault"):
+            actor_input_dim += self.action_dim
+        if actor_latent_input in ("both", "gcn"):
+            actor_input_dim += gcn_out_dim
         self.actor_mlp = MLP(actor_input_dim, mlp_output_dim, actor_hidden_dims, activation)
         if self.distribution is not None:
             self.distribution.init_mlp_weights(self.actor_mlp)
@@ -464,11 +556,21 @@ class EquivGCNActor(nn.Module):
             torch.as_tensor(pos_weight, device=fault_logits.device)
         )
         fault_probability = torch.sigmoid(calibrated_logits).detach()
-        fault_gate = fault_probability.amax(dim=1, keepdim=True)
-        fused_latent = (1.0 + fault_gate * gamma) * gcn_latent + fault_gate * beta
-        actor_input = torch.cat(
-            (obs_policy, fault_probability, fused_latent), dim=-1
+        fault_vector = fault_probability if self.supervise_fault else fault_logits
+        fault_gate = (
+            fault_probability.amax(dim=1, keepdim=True)
+            if self.use_fault_gate
+            else torch.ones_like(fault_probability[:, :1])
         )
+        fused_latent = gcn_latent
+        if self.use_film:
+            fused_latent = (1.0 + fault_gate * gamma) * gcn_latent + fault_gate * beta
+        actor_parts = [obs_policy]
+        if self.actor_latent_input in ("both", "fault"):
+            actor_parts.append(fault_vector)
+        if self.actor_latent_input in ("both", "gcn"):
+            actor_parts.append(fused_latent)
+        actor_input = torch.cat(actor_parts, dim=-1)
         mlp_output = self.actor_mlp(actor_input)
 
         if self.distribution is not None:
@@ -552,6 +654,10 @@ class _TorchEquivGCNActor(nn.Module):
         self.gcn_encoder = copy.deepcopy(model.gcn_encoder)
         self.fault_residual_encoder = copy.deepcopy(model.fault_residual_encoder)
         self.actor_mlp = copy.deepcopy(model.actor_mlp)
+        self.use_film = model.use_film
+        self.use_fault_gate = model.use_fault_gate
+        self.actor_latent_input = model.actor_latent_input
+        self.supervise_fault = model.supervise_fault
         self.obs_dim = model.obs_dim
         self.obs_hist_length = model.obs_hist_length
         if model.distribution is not None:
@@ -585,14 +691,21 @@ class _TorchEquivGCNActor(nn.Module):
         gcn_latent = self.gcn_encoder(obs_history).mean(dim=1)
         fault_logits, gamma, beta = self.fault_residual_encoder(obs_history)
         fault_probability = torch.sigmoid(fault_logits)
-        fault_gate = fault_probability.amax(dim=1, keepdim=True)
-        fused_latent = (
-            (1.0 + fault_gate * gamma) * gcn_latent
-            + fault_gate * beta
+        fault_vector = fault_probability if self.supervise_fault else fault_logits
+        fault_gate = (
+            fault_probability.amax(dim=1, keepdim=True)
+            if self.use_fault_gate
+            else torch.ones_like(fault_probability[:, :1])
         )
-        actor_input = torch.cat(
-            (obs, fault_probability, fused_latent), dim=-1
-        )
+        fused_latent = gcn_latent
+        if self.use_film:
+            fused_latent = (1.0 + fault_gate * gamma) * gcn_latent + fault_gate * beta
+        actor_parts = [obs]
+        if self.actor_latent_input in ("both", "fault"):
+            actor_parts.append(fault_vector)
+        if self.actor_latent_input in ("both", "gcn"):
+            actor_parts.append(fused_latent)
+        actor_input = torch.cat(actor_parts, dim=-1)
         return self.deterministic_output(self.actor_mlp(actor_input))
 
     @torch.jit.export

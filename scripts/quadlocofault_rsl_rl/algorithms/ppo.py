@@ -1680,6 +1680,9 @@ class PPOEquivGCN(PPOGCN):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply sigmoid focal classification loss and FiLM regularization."""
         _, fault_logits, film = extras
+        if not self.actor.supervise_fault:
+            zero = fault_logits.new_zeros(())
+            return zero, zero
         gamma, beta = film
         target = fault_target.to(dtype=fault_logits.dtype)
         binary_ce = nn.functional.binary_cross_entropy_with_logits(

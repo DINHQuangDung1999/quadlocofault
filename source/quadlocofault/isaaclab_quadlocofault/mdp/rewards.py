@@ -52,6 +52,60 @@ def _get_faulty_leg_mask(asset: Articulation, body_names: list[str]) -> torch.Te
         dim=1,
     )
 
+def healthy_stand_still_joint_deviation_l1(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    linear_command_threshold: float = 0.06,
+    angular_command_threshold: float = 0.06,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize default-pose deviation only when standing without a fault.
+
+    Translation (m/s) and yaw (rad/s) have separate command thresholds so
+    turning in place does not trigger the standing penalty. Any joint fault
+    disables the entire term, leaving healthy support joints free to adapt.
+    Assets without fault flags are treated as fully healthy. Use a negative
+    weight.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    standing = (torch.norm(command[:, :2], dim=1) < linear_command_threshold) & (
+        torch.abs(command[:, 2]) < angular_command_threshold
+    )
+    if hasattr(asset, "faulty_joint_idx"):
+        standing = standing & ~asset.faulty_joint_idx.bool().any(dim=1)
+
+    deviation = torch.sum(
+        torch.abs(
+            asset.data.joint_pos[:, asset_cfg.joint_ids]
+            - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+        ),
+        dim=1,
+    )
+    return deviation * standing
+
+
+def healthy_joint_deviation_l1(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize default-pose deviation of healthy joints for every command.
+
+    Faulted joints contribute zero; healthy joints remain regularized during
+    fault recovery. Assets without fault flags are treated as fully healthy.
+    Use a negative reward weight.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    deviation = torch.abs(
+        asset.data.joint_pos[:, asset_cfg.joint_ids]
+        - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    )
+    if hasattr(asset, "faulty_joint_idx"):
+        healthy_joint_mask = ~asset.faulty_joint_idx[:, asset_cfg.joint_ids].bool()
+        deviation = torch.where(healthy_joint_mask, deviation, torch.zeros_like(deviation))
+    return torch.sum(deviation, dim=1)
+
+
 def power_distribution(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize joint torques applied on the articulation using L2 squared kernel.
 
@@ -72,6 +126,22 @@ def joint_power(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityC
     asset: Articulation = env.scene[asset_cfg.name]
     power = asset.data.applied_torque[:, asset_cfg.joint_ids] * asset.data.joint_vel[:, asset_cfg.joint_ids]
     return torch.sum(torch.abs(power), dim=1)
+
+
+def base_height_l2_finite(
+    env: ManagerBasedRLEnv,
+    target_height: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sensor_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Compute the standard base-height penalty and gate non-finite values."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    adjusted_target_height = target_height
+    if sensor_cfg is not None:
+        sensor: RayCaster = env.scene[sensor_cfg.name]
+        adjusted_target_height += torch.mean(sensor.data.ray_hits_w[..., 2], dim=1)
+    penalty = torch.square(asset.data.root_pos_w[:, 2] - adjusted_target_height)
+    return torch.nan_to_num(penalty, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 class ActionSmoothnessPenalty(ManagerTermBase):
@@ -363,6 +433,47 @@ class FaultyHipFootLateralDeviationL2(ManagerTermBase):
             lateral_offset - self.nominal_lateral_offset
         )
         return torch.sum(lateral_deviation_l2 * hip_fault_mask, dim=1)
+
+
+class FaultyFootInwardLateralPositionL2(FaultyHipFootLateralDeviationL2):
+    """Penalize only inward lateral motion of a foot on any faulty leg.
+
+    Each foot's nominal hip-relative lateral offset is captured from the
+    initialized pose. Moving farther outward is unpenalized, preserving the
+    option to widen the support polygon during fault recovery.
+    """
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        asset_cfg: SceneEntityCfg,
+    ) -> torch.Tensor:
+        foot_to_hip_w = (
+            self.asset.data.body_pos_w[:, self.foot_ids, :]
+            - self.asset.data.body_pos_w[:, self.hip_body_ids, :]
+        )
+        yaw_w = yaw_quat(self.asset.data.root_quat_w)
+        yaw_feet = yaw_w.unsqueeze(1).expand(-1, self.num_feet, -1).reshape(-1, 4)
+        foot_to_hip_b = quat_rotate_inverse(
+            yaw_feet, foot_to_hip_w.reshape(-1, 3)
+        ).view(self.asset.num_instances, self.num_feet, 3)
+        lateral_offset = foot_to_hip_b[..., 1]
+
+        if self.nominal_lateral_offset is None:
+            self.nominal_lateral_offset = lateral_offset.detach().mean(
+                dim=0, keepdim=True
+            )
+
+        outward_sign = torch.where(
+            self.nominal_lateral_offset >= 0.0,
+            torch.ones_like(self.nominal_lateral_offset),
+            -torch.ones_like(self.nominal_lateral_offset),
+        )
+        signed_lateral_offset = outward_sign * lateral_offset
+        nominal_outward_offset = torch.abs(self.nominal_lateral_offset)
+        inward_error = torch.relu(nominal_outward_offset - signed_lateral_offset)
+        faulty_leg_mask = _get_faulty_leg_mask(self.asset, self.foot_names)
+        return torch.sum(torch.square(inward_error) * faulty_leg_mask, dim=1)
 
 
 def faulty_leg_link_contact_reward(

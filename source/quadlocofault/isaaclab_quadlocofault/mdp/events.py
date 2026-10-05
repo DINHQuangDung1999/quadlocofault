@@ -29,9 +29,16 @@ def randomize_actuator_faults(
     failure_coef_moderate: float | Sequence[float] | torch.Tensor = 0.8,
     num_faults: int = 1,
     fixed_joint_idx: int | Sequence[int] | torch.Tensor | None = None,
+    allowed_joint_indices: Sequence[int] | torch.Tensor | None = None,
     apply_once_per_episode: bool = False,
+    track_postfault_rewards: bool = False,
+    skip_healthy_episodes: bool = False,
 ):
     asset: Articulation = env.scene[asset_cfg.name]
+    if track_postfault_rewards and not apply_once_per_episode:
+        raise ValueError("Postfault scoring requires apply_once_per_episode=True.")
+    if skip_healthy_episodes and not apply_once_per_episode:
+        raise ValueError("Healthy episodes require apply_once_per_episode=True.")
 
     def _resolve_env_param(
         value: float | Sequence[float] | torch.Tensor,
@@ -69,6 +76,16 @@ def randomize_actuator_faults(
         env_ids = env_ids[~asset.episode_fault_applied[env_ids]]
         if env_ids.numel() == 0:
             return
+        if skip_healthy_episodes:
+            if not hasattr(asset, "episode_healthy"):
+                raise RuntimeError("Healthy episode selection must run at reset before the fault event.")
+            # Healthy episodes were selected at reset. Mark them as handled so
+            # repeated interval callbacks cannot introduce a fault later.
+            healthy = asset.episode_healthy[env_ids]
+            asset.episode_fault_applied[env_ids[healthy]] = True
+            env_ids = env_ids[~healthy]
+            if env_ids.numel() == 0:
+                return
     # breakpoint()
     for actuator in asset.actuators.values():
         size = len(asset.joint_names)
@@ -80,14 +97,29 @@ def randomize_actuator_faults(
         u1 = torch.rand((N, num_faults), device=asset.device) * lb_tensor.unsqueeze(1)  # severe failure
         u2 = torch.rand((N, num_faults), device=asset.device) * (ub_tensor - lb_tensor).unsqueeze(1) + lb_tensor.unsqueeze(1)  # moderate failure
         failure_coef = is_severe*u1 + (1-is_severe)*u2
+        if fixed_joint_idx is not None and allowed_joint_indices is not None:
+            raise ValueError("fixed_joint_idx and allowed_joint_indices are mutually exclusive.")
         if fixed_joint_idx is None:
-            faulty_joint_idx = torch.randint(
+            if allowed_joint_indices is None:
+                candidate_joint_indices = torch.arange(size, device=asset.device)
+            else:
+                candidate_joint_indices = torch.as_tensor(
+                    allowed_joint_indices, dtype=torch.long, device=asset.device
+                ).reshape(-1)
+                if candidate_joint_indices.numel() == 0:
+                    raise ValueError("allowed_joint_indices must not be empty.")
+                if torch.any((candidate_joint_indices < 0) | (candidate_joint_indices >= size)):
+                    raise ValueError(f"All allowed joint indices must be in [0, {size - 1}].")
+                if torch.unique(candidate_joint_indices).numel() != candidate_joint_indices.numel():
+                    raise ValueError("allowed_joint_indices must not contain duplicates.")
+            sampled_candidate_ids = torch.randint(
                 low=0,
-                high=size,
+                high=candidate_joint_indices.numel(),
                 size=(N, num_faults),
                 dtype=torch.long,
                 device=asset.device,
             )
+            faulty_joint_idx = candidate_joint_indices[sampled_candidate_ids]
         elif isinstance(fixed_joint_idx, int):
             if num_faults != 1:
                 raise ValueError("fixed_joint_idx requires num_faults=1.")
@@ -128,6 +160,20 @@ def randomize_actuator_faults(
 
         actuator.stiffness[env_ids] = (asset.data.default_joint_stiffness * asset.motors_strength)[env_ids].clone()
         actuator.damping[env_ids] = (asset.data.default_joint_damping * asset.motors_strength)[env_ids].clone()
+    if track_postfault_rewards:
+        if not hasattr(env, "_postfault_start_step"):
+            env._postfault_start_step = torch.full(
+                (env.num_envs,), -1, dtype=torch.long, device=env.device
+            )
+            env._postfault_reward_start = {
+                name: torch.zeros_like(total)
+                for name, total in env.reward_manager._episode_sums.items()
+            }
+        # Interval events run after reward computation: next step is the first
+        # interval of physics affected by this fault.
+        env._postfault_start_step[env_ids] = env.common_step_counter
+        for name, total in env.reward_manager._episode_sums.items():
+            env._postfault_reward_start[name][env_ids] = total[env_ids]
     if apply_once_per_episode:
         asset.episode_fault_applied[env_ids] = True
 
@@ -136,16 +182,24 @@ def reset_actuator_gains(
     env_ids: torch.Tensor | None,
     asset_cfg: SceneEntityCfg,
     motors_strength_range: tuple[float, float] = (0.9, 1.1),
+    healthy_episode_prob: float = 0.0,
 ):
     asset: Articulation = env.scene[asset_cfg.name]
+    if not 0.0 <= healthy_episode_prob <= 1.0:
+        raise ValueError("healthy_episode_prob must be in [0, 1].")
 
     if env_ids is None:
         env_ids = torch.arange(env.scene.num_envs, device=asset.device)
 
+    if not hasattr(asset, "default_motors_strength"):
+        asset.default_motors_strength = torch.ones(
+            (env.scene.num_envs, len(asset.joint_names)), device=asset.device
+        )
+    low, high = motors_strength_range
+    asset.default_motors_strength[env_ids] = (
+        torch.rand((len(env_ids), len(asset.joint_names)), device=asset.device) * (high - low) + low
+    )
     for actuator in asset.actuators.values():
-        # if not hasattr(asset, "default_motors_strength"): # create default config if first call
-        low, high = motors_strength_range
-        asset.default_motors_strength = torch.rand((env.scene.num_envs, len(asset.joint_names)), device=asset.device) * (high - low) + low
         actuator.stiffness[env_ids] = (asset.data.default_joint_stiffness * asset.default_motors_strength)[env_ids].clone()
         actuator.damping[env_ids] = (asset.data.default_joint_damping * asset.default_motors_strength)[env_ids].clone()
         # breakpoint()
@@ -163,3 +217,19 @@ def reset_actuator_gains(
         # that opt into apply_once_per_episode.
         if hasattr(asset, "episode_fault_applied"):
             asset.episode_fault_applied[env_ids] = False
+    # The interval fault event may check this mask even when every episode is
+    # intentionally faulted (healthy_episode_prob == 0), as in play mode.
+    if not hasattr(asset, "episode_healthy"):
+        asset.episode_healthy = torch.zeros(env.scene.num_envs, dtype=torch.bool, device=asset.device)
+    if healthy_episode_prob:
+        asset.episode_healthy[env_ids] = (
+            torch.rand(env_ids.numel(), device=asset.device) < healthy_episode_prob
+        )
+    else:
+        asset.episode_healthy[env_ids] = False
+
+    # Curriculum is evaluated before reset events, so clear only after scoring.
+    if hasattr(env, "_postfault_start_step"):
+        env._postfault_start_step[env_ids] = -1
+        for total in env._postfault_reward_start.values():
+            total[env_ids] = 0.0

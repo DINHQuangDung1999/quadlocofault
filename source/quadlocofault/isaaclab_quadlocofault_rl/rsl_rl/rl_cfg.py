@@ -255,6 +255,27 @@ class RslRlGCNActorCfg:
     obs_normalization: bool = False
     """Whether to normalize the observation for the model. Defaults to False."""
 
+    graph_reflection_equivariant: bool = True
+    """Canonicalize reflected physical inputs in the 14-node graph encoder."""
+
+    graph_encoder_type: str = "equivariant_14"
+    """Graph backend when the healthy encoder uses a GCN."""
+
+    healthy_encoder_type: str = "graph"
+    """Use the graph encoder or a plain MLP over flattened observation history."""
+
+    use_film: bool = True
+    """Modulate the GCN latent with FiLM; disable for fault-probability concatenation only."""
+
+    use_fault_gate: bool = True
+    """Scale FiLM parameters by the largest predicted fault probability."""
+
+    actor_latent_input: Literal["both", "fault", "gcn"] = "both"
+    """Select which history-derived vectors are concatenated with policy observations."""
+
+    supervise_fault: bool = True
+    """Apply fault classification loss; when false, feed raw trainable logits as an RL latent."""
+
     fault_encoder_type: str = "tcn"
     """Fault-history encoder used by EquivGCN: ``"tcn"`` or ``"mlp"``."""
 

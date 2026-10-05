@@ -213,13 +213,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+        if agent_cfg.class_name == "OnPolicyRunner":
+            # Keep PPO's adaptive-LR scalar synchronized with the learning
+            # rate restored as part of the optimizer checkpoint.
+            runner.alg.learning_rate = runner.alg.optimizer.param_groups[0]["lr"]
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
     # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    runner.learn(
+        num_learning_iterations=agent_cfg.max_iterations,
+        init_at_random_ep_len=getattr(env_cfg, "randomize_initial_episode_length", True),
+    )
 
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
 

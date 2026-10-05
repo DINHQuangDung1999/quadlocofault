@@ -94,14 +94,44 @@ for play_suffix, env_suffix in (("", ""), ("-Play", "_PLAY")):
         terrain="rough",
     )
 
+    _register(
+        task_id=f"EquivGCNMLPConcat-Isaac-Velocity-Rough-Unitree-Go2{play_suffix}-v0",
+        env_cfg=f"UnitreeGo2RoughEquivGCNEnvCfg{env_suffix}",
+        runner_cfg="UnitreeGo2RoughPPOEquivGCNMLPConcatRunnerCfg",
+        terrain="rough",
+    )
+
+    _register(
+        task_id=f"GCNMLP-Isaac-Velocity-Rough-Unitree-Go2{play_suffix}-v0",
+        env_cfg=f"UnitreeGo2RoughEquivGCNEnvCfg{env_suffix}",
+        runner_cfg="UnitreeGo2RoughPPOGCNMLPRunnerCfg",
+        terrain="rough",
+    )
+
+    _register(
+        task_id=f"FLEXMatched-Isaac-Velocity-Rough-Unitree-Go2{play_suffix}-v0",
+        env_cfg=f"UnitreeGo2RoughFLEXMatchedEnvCfg{env_suffix}",
+        runner_cfg="UnitreeGo2RoughPPOFLEXRunnerCfg",
+        terrain="rough",
+    )
+
 
 # Benchmark IDs share the same physical configuration. FTNet retains its
 # paper-specific 49-D proprioception and separate privileged-physics group;
 # all other architectures use the common observation configuration.
 _EVAL_RUNNERS = {
+    "GCNMLP": "UnitreeGo2RoughPPOGCNMLPRunnerCfg",
     "GCN": "UnitreeGo2RoughPPOGCNRunnerCfg",
     "EquivGCN": "UnitreeGo2RoughPPOEquivGCNRunnerCfg",
+    "EquivGCNNoFilm": "UnitreeGo2RoughPPOEquivGCNNoFilmRunnerCfg",
+    "EquivGCNUngatedFilm": "UnitreeGo2RoughPPOEquivGCNUngatedFilmRunnerCfg",
+    "EquivGCNFaultOnly": "UnitreeGo2RoughPPOEquivGCNFaultOnlyRunnerCfg",
+    "EquivGCNGCNOnly": "UnitreeGo2RoughPPOEquivGCNGCNOnlyRunnerCfg",
+    "EquivGCNRLLatent": "UnitreeGo2RoughPPOEquivGCNRLLatentRunnerCfg",
+    "EquivGCN13Node": "UnitreeGo2RoughPPOEquivGCN13NodeRunnerCfg",
+    "HistoryMLP": "UnitreeGo2RoughPPOHistoryMLPRunnerCfg",
     "EquivGCNMLP": "UnitreeGo2RoughPPOEquivGCNMLPRunnerCfg",
+    "EquivGCNMLPConcat": "UnitreeGo2RoughPPOEquivGCNMLPConcatRunnerCfg",
     "FTNet": "UnitreeGo2RoughPPOFTNetRunnerCfg",
     "FLEX": "UnitreeGo2RoughPPOFLEXRunnerCfg",
 }
@@ -115,3 +145,178 @@ for policy_name, runner_cfg in _EVAL_RUNNERS.items():
         runner_cfg=runner_cfg,
         terrain="rough",
     )
+
+
+_register(
+    task_id="EquivGCNMLP-V83-CompleteFault-RandomRough-Unitree-Go2-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNMLPV83CompleteFaultEnvCfg",
+    runner_cfg="UnitreeGo2RoughPPOEquivGCNMLPRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="DreamFLEX-V83-CompleteFault-RandomRough-Unitree-Go2-v0",
+    env_cfg="UnitreeGo2RoughFLEXV83CompleteFaultEnvCfg",
+    runner_cfg="UnitreeGo2RoughPPOFLEXRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="EquivGCNMLP-V84-CompleteFault-MixedTerrain-Unitree-Go2-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNMLPV84CompleteFaultEnvCfg",
+    runner_cfg="UnitreeGo2RoughPPOEquivGCNMLPRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="DreamFLEX-V84-CompleteFault-MixedTerrain-Unitree-Go2-v0",
+    env_cfg="UnitreeGo2RoughFLEXV84CompleteFaultEnvCfg",
+    runner_cfg="UnitreeGo2RoughPPOFLEXRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="EquivGCNMLP-V84-CompleteFault-MixedTerrain-Unitree-Go2-Play-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNMLPV84CompleteFaultEnvCfg_PLAY",
+    runner_cfg="UnitreeGo2RoughPPOEquivGCNMLPRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="DreamFLEX-V84-CompleteFault-MixedTerrain-Unitree-Go2-Play-v0",
+    env_cfg="UnitreeGo2RoughFLEXV84CompleteFaultEnvCfg_PLAY",
+    runner_cfg="UnitreeGo2RoughPPOFLEXRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="FTNet-V84-CompleteFault-MixedTerrain-Unitree-Go2-v0",
+    env_cfg="UnitreeGo2RoughFTNetV84CompleteFaultEnvCfg",
+    runner_cfg="UnitreeGo2RoughPPOFTNetRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="FTNet-V84-CompleteFault-MixedTerrain-Unitree-Go2-Play-v0",
+    env_cfg="UnitreeGo2RoughFTNetV84CompleteFaultEnvCfg_PLAY",
+    runner_cfg="UnitreeGo2RoughPPOFTNetRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="GCN-V84-CompleteFault-MixedTerrain-Unitree-Go2-v0",
+    env_cfg="UnitreeGo2RoughGCNV84CompleteFaultEnvCfg",
+    runner_cfg="UnitreeGo2RoughPPOGCNRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="GCN-V84-CompleteFault-MixedTerrain-Unitree-Go2-Play-v0",
+    env_cfg="UnitreeGo2RoughGCNV84CompleteFaultEnvCfg_PLAY",
+    runner_cfg="UnitreeGo2RoughPPOGCNRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="EquivGCN-V84-CompleteFault-MixedTerrain-Unitree-Go2-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNV84CompleteFaultEnvCfg",
+    runner_cfg="UnitreeGo2RoughPPOEquivGCNRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="EquivGCN-V84-CompleteFault-MixedTerrain-Unitree-Go2-Play-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNV84CompleteFaultEnvCfg_PLAY",
+    runner_cfg="UnitreeGo2RoughPPOEquivGCNRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="EquivGCNMLPConcat-V84-CompleteFault-MixedTerrain-Unitree-Go2-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNMLPConcatV84CompleteFaultEnvCfg",
+    runner_cfg="UnitreeGo2RoughPPOEquivGCNMLPConcatRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="EquivGCNMLPConcat-V84-CompleteFault-MixedTerrain-Unitree-Go2-Play-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNMLPConcatV84CompleteFaultEnvCfg_PLAY",
+    runner_cfg="UnitreeGo2RoughPPOEquivGCNMLPConcatRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="EquivGCNNoFilm-V84-CompleteFault-MixedTerrain-Unitree-Go2-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNV84CompleteFaultEnvCfg",
+    runner_cfg="UnitreeGo2RoughPPOEquivGCNNoFilmRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="EquivGCNNoFilm-V84-CompleteFault-MixedTerrain-Unitree-Go2-Play-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNV84CompleteFaultEnvCfg_PLAY",
+    runner_cfg="UnitreeGo2RoughPPOEquivGCNNoFilmRunnerCfg",
+    terrain="rough",
+)
+
+
+for ablation, runner_cfg in (
+    ("UngatedFilm", "UnitreeGo2RoughPPOEquivGCNUngatedFilmRunnerCfg"),
+    ("FaultOnly", "UnitreeGo2RoughPPOEquivGCNFaultOnlyRunnerCfg"),
+    ("GCNOnly", "UnitreeGo2RoughPPOEquivGCNGCNOnlyRunnerCfg"),
+    ("RLLatent", "UnitreeGo2RoughPPOEquivGCNRLLatentRunnerCfg"),
+):
+    for play_suffix, env_suffix in (("", ""), ("-Play", "_PLAY")):
+        _register(
+            task_id=f"EquivGCN{ablation}-V84-CompleteFault-MixedTerrain-Unitree-Go2{play_suffix}-v0",
+            env_cfg=f"UnitreeGo2RoughEquivGCNV84CompleteFaultEnvCfg{env_suffix}",
+            runner_cfg=runner_cfg,
+            terrain="rough",
+        )
+
+
+_register(
+    task_id="EquivGCN13Node-V84-CompleteFault-MixedTerrain-Unitree-Go2-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNV84CompleteFaultEnvCfg",
+    runner_cfg="UnitreeGo2RoughPPOEquivGCN13NodeRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="EquivGCN13Node-V84-CompleteFault-MixedTerrain-Unitree-Go2-Play-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNV84CompleteFaultEnvCfg_PLAY",
+    runner_cfg="UnitreeGo2RoughPPOEquivGCN13NodeRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="HistoryMLP-V84-CompleteFault-MixedTerrain-Unitree-Go2-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNV84CompleteFaultEnvCfg",
+    runner_cfg="UnitreeGo2RoughPPOHistoryMLPRunnerCfg",
+    terrain="rough",
+)
+
+
+_register(
+    task_id="HistoryMLP-V84-CompleteFault-MixedTerrain-Unitree-Go2-Play-v0",
+    env_cfg="UnitreeGo2RoughEquivGCNV84CompleteFaultEnvCfg_PLAY",
+    runner_cfg="UnitreeGo2RoughPPOHistoryMLPRunnerCfg",
+    terrain="rough",
+)
